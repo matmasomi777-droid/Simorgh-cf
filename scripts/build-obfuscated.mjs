@@ -307,12 +307,19 @@ console.log(`    ماسکِ کلماتِ حساس: ${mask.count} ویرایش �
 if (process.env.DUMP) { writeFileSync(ROOT + '/.dbg-masked.mjs', src, 'utf8'); console.log('    (DUMP: .dbg-masked.mjs نوشته شد)'); }
 
 /* ── ۳) پاک‌سازیِ نامِ توابعِ دارای کلمهٔ کلیدی که در AST به‌عنوانِ binding
-   دیده نمی‌شوند (مثلاً نامِ متد یا property در آبجکتِ export) — برای اطمینان. */
+   دیده نمی‌شوند (مثلاً نامِ متد یا property در آبجکتِ export) — برای اطمینان.
+   ⚠️ `WebSocketPair` دیگر تغییرِ نام نمی‌دهد. دلیلش یک باگِ واقعیِ تولید بود:
+   نسخهٔ قبلی این شناسه را عوض می‌کرد و برای این‌که global ورکر از دست نرود،
+   خطِ `const __CF_WS_PAIR__ = WebSocketPair;` را به **بالای ماژول** می‌گذاشت.
+   در runtime واقعیِ کلاودفلر، `WebSocketPair` در فازِ ارزیابیِ ماژول هنوز
+   تعریف نشده است؛ آن خط با ReferenceError ماژول را می‌کشد و نتیجه‌اش
+   «Error 1101» برای **همهٔ** درخواست‌ها است — با صفر لاگ، چون هیچ کدی اجرا
+   نمی‌شود. (تستِ واقعی: همان بسته بدونِ آن خط ۲۰۰ می‌دهد، با آن خط ۱۱۰۱.)
+   خودِ نامِ WebSocketPair هم رشتهٔ پروتکل نیست و پنهان‌کردنش ارزشی ندارد. */
 for (const [pat, rep] of [
   [/\bvlessHeader\b/g, 'protoHeaderA'],
   [/\bparseVless\b/g, 'parseProtoA'],
   [/\bparseTrojan\b/g, 'parseProtoB'],
-  [/\bWebSocketPair\b/g, '__CF_WS_PAIR__'],   // متغیرِ جهانیِ runtime کلاودفلر — در ابتدای خروجی دوباره وصل می‌شود
   // نام DO دست نمی‌خورد — باید با بایندینگ داشبورد یکی بماند
 ]) src = src.replace(pat, rep);
 
@@ -387,11 +394,10 @@ const obfuscator = require('javascript-obfuscator');
 const result = obfuscator.obfuscate(src, OBF_OPTIONS);
 let out = result.getObfuscatedCode();
 
-/* ── ۵) انتشار دوبارهٔ exportهای سطحِ ماژول + بازگرداندنِ شناسه‌های runtime ── */
+/* ── ۵) انتشار دوبارهٔ exportهای سطحِ ماژول ── */
 const exportParts = [];
 if (needsDefaultPatch) exportParts.push('__MOD_DEFAULT__ as default');
 if (needsClassPatch) exportParts.push('ConnLimiter');
-out = 'const __CF_WS_PAIR__ = WebSocketPair;\n// (WebSocketPair اینجا فقط در همین خطِ اول به‌صورت آگاهانه باقی می‌ماند — global ورکر است، نه رشتهٔ پروتکل)\n' + out;
 out += '\nexport { ' + exportParts.join(', ') + ' };\n';
 
 /* ── ۶) اعتبارسنجی ──

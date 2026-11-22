@@ -150,8 +150,8 @@ function exitDialHost(srv) {
    BUILD: مُهرِ زمانِ بیلد (UTC)
    BUILD_REV: اثرِ انگشتِ sha256 محتوای worker.js + ui — معیارِ دقیقِ «نسخه‌ی
    تازه» در بررسیِ آپدیت است (بدونِ تکیه بر تاریخ؛ چند پوش در یک روز هم دیده می‌شود) */
-const VERSION = '3.0.28';
-const BUILD = '2026.11.22-16:01';
+const VERSION = '3.0.29';
+const BUILD = '2026.11.22-17:45';
 const BUILD_REV = '4bfd155d360f0ebad2482329ffbfca9d12d73f9f1423db3ddb72bbe70a33af81';
 const BOOT = Date.now();
 /* شاخه‌ی پیش‌فرض برای بررسیِ نسخه */

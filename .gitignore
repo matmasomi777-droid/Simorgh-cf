@@ -17,3 +17,6 @@ tests-manual/.e2e/
 
 # لاگِ سرورِ محلیِ workerd (npm run dev:workerd)
 .wrangler-dev.log
+
+# توکنِ موقتِ تست — هرگز کامیت نشود
+.cf_token
