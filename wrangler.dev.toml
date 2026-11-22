@@ -1,0 +1,14 @@
+# پیکربندیِ مخصوصِ تستِ محلی در runtime واقعیِ کلاودفلر (workerd)
+# شبیه‌سازیِ «پیست در داشبورد + بایندِ D1» — همان ترکیبی که کاربر دارد.
+name = "panel-dev"
+main = "_worker.obf.js"
+compatibility_date = "2026-11-22"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "panel-dev-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[observability]
+enabled = true

@@ -14,3 +14,6 @@ package-lock.json
 tests-manual/.e2e/
 # پیامِ کامیتِ موقت (فقط برای اسکریپت‌ها)
 .commitmsg.txt
+
+# لاگِ سرورِ محلیِ workerd (npm run dev:workerd)
+.wrangler-dev.log

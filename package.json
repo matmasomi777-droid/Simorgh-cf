@@ -18,11 +18,14 @@
     "test:reality-live": "node tests-manual/reality-live-e2e.cjs",
     "test:real": "node tests-manual/real-client-e2e.cjs",
     "test:ui-eq": "node tests-manual/ui-equivalence.cjs",
+    "test:workerd": "node tests-manual/workerd-1101.cjs",
+    "dev:workerd": "wrangler dev --config wrangler.dev.toml --port 8787 --ip 127.0.0.1",
     "test:api:obf": "npm run build && node tests-manual/api-routes.cjs _worker.obf.js"
   },
   "devDependencies": {
     "acorn": "^8.18.0",
     "javascript-obfuscator": "^4.1.1",
-    "jsdom": "^30.0.1"
+    "jsdom": "^30.0.1",
+    "wrangler": "^4.166.0"
   }
 }

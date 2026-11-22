@@ -150,9 +150,9 @@ function exitDialHost(srv) {
    BUILD: مُهرِ زمانِ بیلد (UTC)
    BUILD_REV: اثرِ انگشتِ sha256 محتوای worker.js + ui — معیارِ دقیقِ «نسخه‌ی
    تازه» در بررسیِ آپدیت است (بدونِ تکیه بر تاریخ؛ چند پوش در یک روز هم دیده می‌شود) */
-const VERSION = '3.0.26';
-const BUILD = '2026.11.22-15:41';
-const BUILD_REV = '4076a6906c197b4e0cfc7bacd55462541bea2af65f9fd6b419c54b1bb2ce8d52';
+const VERSION = '3.0.28';
+const BUILD = '2026.11.22-16:01';
+const BUILD_REV = '4bfd155d360f0ebad2482329ffbfca9d12d73f9f1423db3ddb72bbe70a33af81';
 const BOOT = Date.now();
 /* شاخه‌ی پیش‌فرض برای بررسیِ نسخه */
 const UPD_DEFAULT_BRANCH = 'main';
@@ -161,7 +161,7 @@ const UPD_DEFAULT_BRANCH = 'main';
 const UPD_DEFAULT_REPO = 'matmasomi777-droid/Sub';
 let UPD_CACHE = { at: 0, key: '', data: null };
 /* ذخیره‌سازی فقط با D1 — KV حذف شد */
-let UI = { html: null, ts: 0 }; // کش UI
+let UI = { html: null, ts: 0, gz: null }; // کش UI (html + نسخهٔ gzipِ آماده)
 const RATE = new Map();         // rate limiting
 /* ضد-1101 (نهان): سقف حافظه isolate — رشد بی‌نهایت Map یعنی OOM و 1101 */
 function pruneRateNahan() { try { if (RATE.size > 10000) RATE.clear(); } catch (e) {} }
@@ -318,6 +318,29 @@ function bg(ctx, p) {
     return null;
   }
 }
+/* ═══════════════════════════════════════════════════════════════════════════
+   آخرین خطای مهارشده — «چرا این درخواست ۴۰۴ شد؟»
+
+   تا امروز هر استثنا در catch بیرونی بلعیده می‌شد و کاربر فقط یک ۴۰۴ بی‌معنا
+   می‌دید (یا بدتر: صفحهٔ ۱۱۰۱ کلاودفلر، وقتی استثنا از fetch بیرون می‌زد).
+   حالا محل + پیام + زمانِ آخرین خطا در حافظهٔ isolate می‌ماند و از /health
+   خوانده می‌شود. این تنها راهی است که بدونِ دسترسی به لاگ‌های زندهٔ داشبورد
+   می‌توان فهمید «چه چیزی» می‌شکند — همان چیزی که در گزارش‌های ۱۱۰۱ غایب بود.
+   ═══════════════════════════════════════════════════════════════════════════ */
+let LAST_ERR = null;
+let ERR_COUNT = 0;
+function noteErr(where, e) {
+  try {
+    ERR_COUNT++;
+    LAST_ERR = {
+      ts: Date.now(),
+      at: new Date().toISOString(),
+      where: String(where || '').slice(0, 160),
+      msg: String((e && e.stack) || (e && e.message) || e).slice(0, 400),
+    };
+  } catch (e2) {}
+}
+
 const randHex = (n = 6) => Array.from({ length: n }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -335,21 +358,38 @@ const randHex = (n = 6) => Array.from({ length: n }, () => '0123456789abcdef'[Ma
 function acceptsGzip(req) {
   try { return /\bgzip\b/i.test(String((req && req.headers && req.headers.get('accept-encoding')) || '')); } catch (e) { return false; }
 }
+
+/** فشرده‌سازیِ یک‌بارهٔ متن با gzip → بایت‌های آمادهٔ سرو */
+async function gzipBytes(text) {
+  if (typeof CompressionStream !== 'function') return null;
+  try {
+    const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  } catch (e) { return null; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   پاسخِ HTML — با gzipِ کش‌شده، نه gzipِ هر درخواست
+
+   ⚠️ درسِ گران: نسخهٔ اولِ این تابع بدنهٔ ۳۱۴ کیلوبایتی را در *هر* درخواست
+   فشرده می‌کرد. اندازه‌گیری: ~۶۱ms CPU برای هر بار. روی پلنِ رایگانِ
+   کلاودفلر سقفِ CPU ۱۰ms است — یعنی همان تغییری که برای «سریع‌تر شدن» آمده
+   بود، خودش می‌توانست دلیلِ «Worker exceeded CPU» (و در نتیجه ۱۱۰۱) شود.
+   حالا gzip یک‌بار هنگامِ ساختِ UI انجام می‌شود و بایت‌های آماده در UI.gz
+   می‌مانند؛ هر درخواست فقط همان بافر را برمی‌گرداند.
+   ═══════════════════════════════════════════════════════════════════════════ */
 function htmlResponse(body, req, headers = {}) {
   const h = { 'content-type': 'text/html; charset=utf-8', ...headers };
   const text = String(body == null ? '' : body);
   /* زیرِ ۱KB فشرده‌سازی فایده ندارد (سرباریِ هدرِ gzip بیشتر است) */
-  if (text.length < 1024 || !acceptsGzip(req) || typeof CompressionStream !== 'function') {
-    return new Response(text, { headers: h });
-  }
-  try {
-    const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+  if (text.length < 1024 || !acceptsGzip(req)) return new Response(text, { headers: h });
+  /* فقط بدنهٔ کش‌شدهٔ UI بایتِ آماده دارد؛ خطایِ بارگذاری همان متنِ خام می‌رود */
+  if (UI.html === text && UI.gz && UI.gz.length) {
     h['content-encoding'] = 'gzip';
     h['vary'] = 'accept-encoding';
-    return new Response(stream, { headers: h });
-  } catch (e) {
-    return new Response(text, { headers: h });
+    return new Response(UI.gz, { headers: h });
   }
+  return new Response(text, { headers: h });
 }
 const randTok = (n = 14) => Array.from({ length: n }, () => 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random() * 62)]).join('');
 const b64 = (s) => btoa(unescape(encodeURIComponent(s)));
@@ -3323,7 +3363,7 @@ async function uiValidate(env) {
         UI_ETAGS[p.u] = { etag: p.etag, lastMod: p.lastMod, ts: now };
       });
       UI_VALIDATE.ts = now;
-      if (changed) { UI.ts = 0; USER_HTML = null; }   /* کشِ UI باطل → درخواستِ بعدی تازه می‌سازد */
+      if (changed) { UI.ts = 0; UI.gz = null; USER_HTML = null; }   /* کشِ UI باطل → درخواستِ بعدی تازه می‌سازد */
       return changed;
     } catch (e) { return false; }
   })().finally(() => { UI_VALIDATE.inFlight = null; });
@@ -6571,7 +6611,9 @@ window.addEventListener('error',function(e){console.error('sg:',e.message,e.file
     const out = html
       .replace('<!--STYLESHEET-->', () => '<style>' + css + '</style>')
       .replace('<!--APPJS-->', () => prelude + '<script>' + js + '</script>');
-    UI = { html: out, ts: Date.now() };
+    /* نسخهٔ gzip یک‌بار همین‌جا ساخته می‌شود (هر ۵ دقیقه یک‌بار)، نه در هر
+       درخواست — ۳۱۴KB gzip حدودِ ۶۱ms CPU است و روی پلنِ رایگان کشنده است. */
+    UI = { html: out, ts: Date.now(), gz: await gzipBytes(out) };
     st.uiLoaded = Date.now();
     st.uiSource = 'matmasomi777-droid/Sub (ثابت)';
     /* ⚠️ این نوشتن دیگر await نمی‌شود: صرفاً یک مُهرِ زمانیِ نمایشی است و
@@ -6766,6 +6808,20 @@ async function apiRoute(req, env, url, ctx) {
     ok: true, version: VERSION, build: BUILD, rev: BUILD_REV,
     uptimeSec: Math.floor((Date.now() - BOOT) / 1000),
     storage: backendOf(env),
+    /* ═══ تشخیصِ «چرا خطا می‌گیرم» بدونِ دسترسی به لاگ‌ها ═══════════════════
+       runtime: آیا کد زیرِ nodejs_compat اجرا می‌شود؟ (compat date ≥ 2026-08-04
+       آن را خودکار روشن می‌کند). بعضی ناسازگاری‌ها فقط در همین حالت دیده می‌شوند.
+       lastError: آخرین استثنای مهارشده با محل و پیام — تا «۴۰۴ بی‌دلیل» و
+       «پنل باز نمی‌شود» به یک پیامِ مشخص تبدیل شود.
+       errors: شمارِ کلِ استثناهای مهارشده از شروعِ این isolate. */
+    runtime: {
+      nodejsCompat: (typeof process !== 'undefined' && !!(process && process.versions)),
+      compression: (typeof CompressionStream === 'function'),
+      nodeBuffer: (typeof Buffer !== 'undefined'),
+      compat: (typeof process !== 'undefined' && process.env && process.env.NODE_ENV) ? 'node-env-set' : 'clean',
+    },
+    errors: ERR_COUNT,
+    lastError: LAST_ERR,
     /* ⚠️ مرجعِ شمارشِ محدودیت — 'mem' یعنی سقفِ آی‌پی بین isolateها اعمال
        نمی‌شود. این فیلد عمداً در /health هست تا بتوان بدون ورود هم فهمید
        بایندینگ‌ها (LIMITER / DB / KV) درست تنظیم شده‌اند یا نه.
@@ -11016,7 +11072,7 @@ async function tunnelHandler(request, env, st, ctx) {
   /* همه‌ی کارهای سنگین در پس‌زمینه — بدون مسدود کردن handshake */
   session(server, request.headers.get('sec-websocket-protocol') || '', st, env, ctx, clientIp,
     boot, selfHost, connMeta)
-    .catch(() => { try { server.close(); } catch (e) {} }); // ضد-1101 (نهان): خطای تونل هرگز به fetch برنگردد
+    .catch((eS) => { try { noteErr('session', eS); server.close(); } catch (e) {} }); // ضد-1101 (نهان): خطای تونل هرگز به fetch برنگردد
 
   return new Response(null, { status: 101, webSocket: client });
 }
@@ -11239,26 +11295,42 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
     try { await connRelease(env, user && user.uuid, ip, connId); } catch (e) {}
   };
 
+  /* ═══════════════════════════════════════════════════════════════════════════
+     finish — پایانِ نشست. **هرگز نباید reject شود.**
+
+     چرا این‌قدر مهم است (همان چیزی که BPB در issue #1484 پیدا کرد و ۱۱۰۱ داد):
+     این تابع از داخلِ event listener های وب‌سوکت صدا زده می‌شود
+     (`addEventListener('close'|'error')` و `cancel()`/`abort()`ِ استریم‌ها) و
+     نتیجه‌اش هیچ‌جا await یا .catch نمی‌شود. اگر یک rejection از آن بیرون بزند،
+     به‌صورتِ «unhandled rejection» به runtime می‌رسد و کلاودفلر آن را با
+     Error 1101 نشان می‌دهد — بی‌این‌که هیچ try/catch ای در مسیرِ fetch ببیندش.
+     پس کلِ بدنه در try/catch پیچیده شده و مقدارِ برگشتی همیشه undefined است.
+     ═══════════════════════════════════════════════════════════════════════════ */
   const finish = async () => {
-    if (closed) return;
-    closed = true;
-    ctxClosed = true;
-    /* ضربانِ دوره‌ای اول خاموش می‌شود تا در فاصله‌ی آزادسازی، تمدیدِ در صف
-       ردیفِ تازه‌آزادشده را زنده نکند */
-    stopKeepAlive();
-    try { if (ws.readyState === 1 || ws.readyState === 2) ws.close(); } catch (e) {}
-    try { sock && sock.close(); } catch (e) {}
-    /* ثبت مصرفِ باقیمانده + آزاد کردن سهمیه — کاملاً در پس‌زمینه */
-    const dUp = pendUp, dDown = pendDown, dReqs = pendReqs, u = user;
-    pendUp = 0; pendDown = 0; pendReqs = 0;
-    const p = (async () => {
-      if (u && (dUp || dDown || dReqs)) { try { await usageDelta(env, u.uuid, dUp, dDown, dReqs); } catch (e) {} }
-      /* حجمِ باقیمانده‌ی همین نشست — قبل از آزادسازی ثبت می‌شود (همان conn_id) */
-      if (dUp || dDown) { try { await metaBytes(env, connId, dUp, dDown); } catch (e) {} }
-      await releaseConn();
-    })();
-    bg(ctx, p);
-    try { await p; } catch (e) {}
+    try {
+      if (closed) return;
+      closed = true;
+      ctxClosed = true;
+      /* ضربانِ دوره‌ای اول خاموش می‌شود تا در فاصله‌ی آزادسازی، تمدیدِ در صف
+         ردیفِ تازه‌آزادشده را زنده نکند */
+      stopKeepAlive();
+      try { if (ws.readyState === 1 || ws.readyState === 2) ws.close(); } catch (e) {}
+      try { sock && sock.close(); } catch (e) {}
+      /* ثبت مصرفِ باقیمانده + آزاد کردن سهمیه — کاملاً در پس‌زمینه */
+      const dUp = pendUp, dDown = pendDown, dReqs = pendReqs, u = user;
+      pendUp = 0; pendDown = 0; pendReqs = 0;
+      const p = (async () => {
+        if (u && (dUp || dDown || dReqs)) { try { await usageDelta(env, u.uuid, dUp, dDown, dReqs); } catch (e) {} }
+        /* حجمِ باقیمانده‌ی همین نشست — قبل از آزادسازی ثبت می‌شود (همان conn_id) */
+        if (dUp || dDown) { try { await metaBytes(env, connId, dUp, dDown); } catch (e) {} }
+        await releaseConn();
+      })().catch(() => {});
+      bg(ctx, p);
+      try { await p; } catch (e) {}
+    } catch (e) {
+      /* حتی خطای خودِ پاک‌سازی هم نباید به runtime برسد */
+      try { noteErr('session:finish', e); } catch (e2) {}
+    }
   };
 
   /* fallback با fetch برای درخواست‌های HTTP وقتی connect() به مقصد وصل نمی‌شود
@@ -12094,7 +12166,7 @@ export default {
          پس پاسخ HTML خطای کلاودفلار برمی‌گشت = «bad json». با .catch این مشکل حل می‌شود. */
       if (url.pathname === '/health' || url.pathname.startsWith('/api/')) {
         try { return await apiHandler(request, env, url, ctx); }
-        catch (e) { return json({ ok: false, error: 'خطای داخلی: ' + String((e && e.message) || e) }, 500); }
+        catch (e) { noteErr('api', e); return json({ ok: false, error: 'خطای داخلی: ' + String((e && e.message) || e) }, 500); }
       }
 
       const st = seed(await load(env)), s = st.settings;
@@ -12112,7 +12184,7 @@ export default {
          پاسخِ استتار برمی‌گردد نه 500/1101 — همان رفتاری که مسیرهای دیگر دارند. */
       if (isWs) {
         try { return await tunnelHandler(request, env, await load(env), ctx); }
-        catch (eTunnel) { return await decoyPage(s, false, request, url); }
+        catch (eTunnel) { noteErr('tunnel', eTunnel); return await decoyPage(s, false, request, url); }
       }
 
       /* ۲) مسیرهای ریشه‌ای زیر مسیر مخفی */
@@ -12180,6 +12252,7 @@ export default {
       return await cover();
     } catch (e) {
       // Anti-1101 (Nahan): any uncaught error -> 404 benign, never 500/throw which shows real 1101 page
+      try { noteErr(url ? url.pathname : '?', e); } catch (e3) {}
       try { return new Response('Not Found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } }); } catch (e2) { return new Response(null, { status: 404 }); }
     } finally {
       /* ⚠️ نوشتنِ باقیمانده در D1 — بعد از کامل شدنِ پاسخ.
