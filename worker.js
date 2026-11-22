@@ -150,9 +150,9 @@ function exitDialHost(srv) {
    BUILD: مُهرِ زمانِ بیلد (UTC)
    BUILD_REV: اثرِ انگشتِ sha256 محتوای worker.js + ui — معیارِ دقیقِ «نسخه‌ی
    تازه» در بررسیِ آپدیت است (بدونِ تکیه بر تاریخ؛ چند پوش در یک روز هم دیده می‌شود) */
-const VERSION = '3.0.22';
-const BUILD = '2026.10.29-07:02';
-const BUILD_REV = '7ddd443edde597221d99748366f10600522c54ef940fc68b4ca20fb0c688e7e7';
+const VERSION = '3.0.26';
+const BUILD = '2026.11.22-15:41';
+const BUILD_REV = '4076a6906c197b4e0cfc7bacd55462541bea2af65f9fd6b419c54b1bb2ce8d52';
 const BOOT = Date.now();
 /* شاخه‌ی پیش‌فرض برای بررسیِ نسخه */
 const UPD_DEFAULT_BRANCH = 'main';
@@ -281,10 +281,76 @@ const DEF = () => ({
 
 /* ════════════════════════════ ابزارها ════════════════════════════ */
 const J = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
-const json = (d, s = 200, h = {}) => new Response(JSON.stringify(d, null, 2), { status: s, headers: { ...J, ...h } });
+/* ═══ JSON بدونِ فاصلهٔ اضافه ═══════════════════════════════════════════════
+   قبلاً هر پاسخ با JSON.stringify(d, null, 2) ساخته می‌شد — یعنی پاسخِ
+   /api/state (که پنل هر ۵ ثانیه می‌گیرد) با تورفتگیِ دو فاصله‌ای سریال می‌شد:
+   ۲۰ تا ۴۰ درصد بایتِ بیشتر و CPUِ بیشتر برای ساخت و برای پارس در مرورگر.
+   حالا فقط وقتی «pretty» صریحاً خواسته شود (دیباگ) تورفتگی می‌گیرد. */
+const json = (d, s = 200, h = {}) => new Response(JSON.stringify(d), { status: s, headers: { ...J, ...h } });
+const jsonPretty = (d, s = 200, h = {}) => new Response(JSON.stringify(d, null, 2), { status: s, headers: { ...J, ...h } });
 const txt = (b, h = {}, s = 200) => new Response(b, { status: s, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', ...h } });
 const enc = new TextEncoder();
+/* ═══════════════════════════════════════════════════════════════════════════
+   اجرای پس‌زمینه — تنها راهِ درستِ صدا زدنِ waitUntil
+
+   چرا این تابع وجود دارد (و چرا ۱۱۰۱ می‌داد):
+   `ctx.waitUntil()` فقط تا وقتی درخواست «زنده» است مجاز است. اگر بعد از پایانِ
+   درخواست صدا زده شود (تایمری که از درخواست جان به در برده، تمدیدِ اتصالی که
+   کلاینت قطعش کرده، …) runtime یک استثنا پرتاب می‌کند. آن استثنا داخلِ یک
+   callbackِ تایمر/رویداد رخ می‌دهد، پس هیچ try/catch ای در مسیرِ fetch آن را
+   نمی‌گیرد → isolate کشته می‌شود و هر درخواستِ بعدی روی همان isolate با
+   «Error 1101» برمی‌گردد. همین الگو دقیقاً توضیح می‌دهد چرا پنل «چند ثانیه تا
+   چند دقیقه» کار می‌کرد و بعد یک‌سره می‌مرد.
+
+   این تابع سه کار می‌کند:
+     ۱) هر promise را به .catch(() => {}) می‌بندد (بدونِ rejectionِ رهاشده)؛
+     ۲) خطای خودِ waitUntil را می‌بلعد؛
+     ۳) اگر ctx نبود، promise را همان‌جا رها می‌کند تا معلق نماند.
+   ═══════════════════════════════════════════════════════════════════════════ */
+function bg(ctx, p) {
+  let q = p;
+  try { if (q && typeof q.catch === 'function') q = q.catch(() => {}); } catch (e) {}
+  try {
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(q);
+    return q;
+  } catch (e) {
+    /* درخواست تمام شده — کار در پس‌زمینه رها می‌شود (نتیجه‌اش دیگر به کسی نمی‌رسد) */
+    return null;
+  }
+}
 const randHex = (n = 6) => Array.from({ length: n }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   پاسخِ HTML با gzip
+
+   چرا: بدنهٔ پنل (HTML + CSS + app.jsِ درون‌خط) حدودِ ۳۸۰ کیلوبایت است و
+   با هر باز شدنِ صفحه کامل دانلود می‌شد. gzip آن را به ~۷۰ کیلوبایت می‌رساند
+   — روی موبایل و اینترنتِ ایران تفاوتش بین «چند ثانیه» و «فوری» است.
+   Cloudflare این کار را برای دارایی‌های استاتیک خودش می‌کند، ولی پاسخِ
+   ورکر (که از استریم ساخته می‌شود) بدونِ این خط فشرده نمی‌شد.
+
+   فقط وقتی فشرده می‌کنیم که کلاینت صریحاً gzip را بپذیرد؛ در غیرِ این صورت
+   همان بدنهٔ خام برمی‌گردد (هیچ کلاینتی نمی‌شکند).
+   ═══════════════════════════════════════════════════════════════════════════ */
+function acceptsGzip(req) {
+  try { return /\bgzip\b/i.test(String((req && req.headers && req.headers.get('accept-encoding')) || '')); } catch (e) { return false; }
+}
+function htmlResponse(body, req, headers = {}) {
+  const h = { 'content-type': 'text/html; charset=utf-8', ...headers };
+  const text = String(body == null ? '' : body);
+  /* زیرِ ۱KB فشرده‌سازی فایده ندارد (سرباریِ هدرِ gzip بیشتر است) */
+  if (text.length < 1024 || !acceptsGzip(req) || typeof CompressionStream !== 'function') {
+    return new Response(text, { headers: h });
+  }
+  try {
+    const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+    h['content-encoding'] = 'gzip';
+    h['vary'] = 'accept-encoding';
+    return new Response(stream, { headers: h });
+  } catch (e) {
+    return new Response(text, { headers: h });
+  }
+}
 const randTok = (n = 14) => Array.from({ length: n }, () => 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random() * 62)]).join('');
 const b64 = (s) => btoa(unescape(encodeURIComponent(s)));
 const b64u = (s) => btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -469,40 +535,67 @@ async function usageEnsure(env) {
     return false;
   }
   try {
-    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS usage (
-      uuid TEXT PRIMARY KEY,
-      up INTEGER NOT NULL DEFAULT 0,
-      down INTEGER NOT NULL DEFAULT 0,
-      reqs INTEGER NOT NULL DEFAULT 0,
-      last_seen INTEGER
-    )`).run();
-    /* جدول نشست‌ها — برای محدودیت IP و اتصال همزمان
-       ⚠️ ستون conns الزامی است — بدون آن همه‌ی کوئری‌های شمارنده خطا می‌خورند
-       و محدودیت بی‌صدا غیرفعال می‌شود */
-    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS sessions (
-      uuid TEXT NOT NULL,
-      ip TEXT NOT NULL,
-      conns INTEGER NOT NULL DEFAULT 1,
-      last_active INTEGER NOT NULL,
-      PRIMARY KEY (uuid, ip)
-    )`).run();
-    /* مهاجرت: نصب‌های قدیمی که جدول بدون ستون conns دارند */
-    try {
-      await env.DB.prepare('ALTER TABLE sessions ADD COLUMN conns INTEGER NOT NULL DEFAULT 1').run();
-    } catch (e) { /* ستون از قبل هست */ }
-    /* ایندکس برای پاک‌سازی سریع */
-    await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(last_active)').run();
-    /* سطل روزانه برای سهمیه‌ی روزانه — نصب‌های قدیمی این ستون‌ها را ندارند */
-    for (const col of ['day TEXT', 'day_up INTEGER NOT NULL DEFAULT 0', 'day_down INTEGER NOT NULL DEFAULT 0', 'day_reqs INTEGER NOT NULL DEFAULT 0']) {
-      try { await env.DB.prepare('ALTER TABLE usage ADD COLUMN ' + col).run(); } catch (e) { /* از قبل هست */ }
+    /* ═══ یک رفت‌وبرگشت به‌جای هفت ═══════════════════════════════════════
+       قبلاً هر دستور جدا اجرا می‌شد: ۴ × CREATE + ۵ × ALTER (که چهارتایشان
+       عمداً خطا می‌دادند تا بفهمیم ستون هست یا نه). روی اولین اتصالِ بعد از
+       سرد شدنِ isolate این یعنی ~۱۰ رفت‌وبرگشتِ D1 پیش از آن‌که یک بایت
+       ترافیک رد شود — و هر ALTERِ تکراری یک خطای کامل از لبه برمی‌گرداند.
+       حالا همه‌ی CREATEها در یک batch (یک رفت‌وبرگشت) و مهاجرت با یک
+       PRAGMA table_info که می‌گوید کدام ستون‌ها کم است. */
+    await env.DB.batch([
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS usage (
+        uuid TEXT PRIMARY KEY,
+        up INTEGER NOT NULL DEFAULT 0,
+        down INTEGER NOT NULL DEFAULT 0,
+        reqs INTEGER NOT NULL DEFAULT 0,
+        last_seen INTEGER
+      )`),
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS sessions (
+        uuid TEXT NOT NULL,
+        ip TEXT NOT NULL,
+        conns INTEGER NOT NULL DEFAULT 1,
+        last_active INTEGER NOT NULL,
+        PRIMARY KEY (uuid, ip)
+      )`),
+      env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(last_active)'),
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS usage_history (
+        day TEXT PRIMARY KEY,
+        up INTEGER NOT NULL DEFAULT 0,
+        down INTEGER NOT NULL DEFAULT 0,
+        reqs INTEGER NOT NULL DEFAULT 0
+      )`),
+    ]);
+    /* مهاجرت: نصب‌های قدیمی ستون‌های conns / day_* را ندارند */
+    const colsOf = async (t) => {
+      try {
+        const r = await env.DB.prepare('PRAGMA table_info(' + t + ')').all();
+        const set = new Set(((r && r.results) || []).map((x) => x && x.name));
+        return set.size ? set : null;
+      } catch (e) { return null; }
+    };
+    const [uc, sc] = await Promise.all([colsOf('usage'), colsOf('sessions')]);
+    const alters = [];
+    if (sc && !sc.has('conns')) alters.push('ALTER TABLE sessions ADD COLUMN conns INTEGER NOT NULL DEFAULT 1');
+    if (uc) {
+      if (!uc.has('day')) alters.push('ALTER TABLE usage ADD COLUMN day TEXT');
+      if (!uc.has('day_up')) alters.push('ALTER TABLE usage ADD COLUMN day_up INTEGER NOT NULL DEFAULT 0');
+      if (!uc.has('day_down')) alters.push('ALTER TABLE usage ADD COLUMN day_down INTEGER NOT NULL DEFAULT 0');
+      if (!uc.has('day_reqs')) alters.push('ALTER TABLE usage ADD COLUMN day_reqs INTEGER NOT NULL DEFAULT 0');
     }
-    /* تاریخچه‌ی مصرف برای نمودارها — روزهای بسته‌شده (روزشده در usageDelta هنگام تعویض روز) */
-    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS usage_history (
-      day TEXT PRIMARY KEY,
-      up INTEGER NOT NULL DEFAULT 0,
-      down INTEGER NOT NULL DEFAULT 0,
-      reqs INTEGER NOT NULL DEFAULT 0
-    )`).run();
+    /* اگر PRAGMA در دسترس نبود (نتیجه null)، همان رفتارِ قدیمی: تلاشِ کورِ
+       ALTER — خطای «ستون از قبل هست» بی‌خطر است و چیزی را نمی‌شکند. */
+    if (!uc && !sc) {
+      alters.push(
+        'ALTER TABLE sessions ADD COLUMN conns INTEGER NOT NULL DEFAULT 1',
+        'ALTER TABLE usage ADD COLUMN day TEXT',
+        'ALTER TABLE usage ADD COLUMN day_up INTEGER NOT NULL DEFAULT 0',
+        'ALTER TABLE usage ADD COLUMN day_down INTEGER NOT NULL DEFAULT 0',
+        'ALTER TABLE usage ADD COLUMN day_reqs INTEGER NOT NULL DEFAULT 0',
+      );
+    }
+    if (alters.length) {
+      try { await env.DB.batch(alters.map((s) => env.DB.prepare(s))); } catch (e) { /* هم‌زمانیِ دو isolate — بی‌خطر */ }
+    }
     USAGE_LAST_ERR = null;
     return true;
   } catch (e) {
@@ -2006,29 +2099,43 @@ async function usageFresh(env, uuid) {
   } catch (e) { return { up: 0, down: 0, reqs: 0, lastSeen: null, dayUp: 0, dayDown: 0 }; }
 }
 
-/** بارگذاری — فقط یک‌بار در طول عمر isolate */
+/** بارگذاری — با کشِ کوتاه و «هم‌جوشیِ درخواست‌های هم‌زمان» */
+let LOADING = null;                   // promise در جریان — جلوگیری از طوفانِ D1
+let MEM_GEN = 0;                      // نسلِ state — save() آن را بالا می‌برد
 async function load(env) {
   /* ⚠️ کشِ کوتاهِ ۴ ثانیه‌ای: قبلاً MEM تا پایانِ عمرِ isolate کش می‌ماند و
      تغییراتِ ایزوله‌های دیگر (مسلح‌شدنِ انقضا در dial، لاگِ اسکنِ رادار،
      کاربرِ تازه) هرگز به پنل نمی‌رسید — برای همین «منتظر اولین اتصال»
      و لاگ‌های ثبت‌شده‌ی جاهای دیگر دیده نمی‌شدند. حالا حداکثر ۴ ثانیه
-     بعد، پنل state را از D1 دوباره می‌خواند. */
+     بعد، پنل state را از D1 دوباره می‌خواند.
+     ⚠️ طوفانِ D1: پنل هر ۵ ثانیه /api/state می‌زند و هر درخواست هم تونل
+     ممکن است هم‌زمان load() بخواهد. وقتی کش منقضی می‌شد، هر درخواستِ هم‌زمان
+     یک SELECT جدا می‌زد (تا ۱۰ کوئریِ یکسان برای یک state). حالا اولین
+     درخواست می‌خواند و بقیه همان promise را await می‌کنند. */
   if (MEM && (Date.now() - MEM_TS < MEM_TTL || (!env.DB && !env.KV))) return MEM;
-  const raw = await d1Read(env);
-  if (raw !== null && raw !== undefined) {
-    try { MEM = merge(DEF(), JSON.parse(raw)); } catch (e) { /* blob خراب — کشِ فعلی می‌ماند */ }
-  } else if (!MEM) {
-    MEM = DEF();
-  }
-  /* Anti-1101 round3 (Nahan): fallback نهایی روی پیش‌فرض‌ها.
-     اگر blob خراب باشد و isolate سرد باشد، MEM تا اینجا null می‌ماند و
-     هر فراخواننده‌ی «(await load(env)).settings» می‌ترکد — یعنی 1101 برای
-     همه‌ی مسیرها، حتی تونل. مثل loadSysConfig در نهان که روی SYSTEM_DEFAULTS
-     برمی‌گردد، این‌جا هم روی DEF() سقوط می‌کنیم؛ پنل بالا می‌آید و ادمین
-     می‌تواند تنظیمات را دوباره ذخیره کند. */
-  if (!MEM) { try { MEM = DEF(); } catch (e2) { MEM = { settings: { auth: { path: 'panel', sub: { path: 'sub' } } }, users: [] }; } }
-  MEM_TS = Date.now();
-  return MEM;
+  if (LOADING) return LOADING;
+  LOADING = (async () => {
+    const gen = MEM_GEN;
+    const raw = await d1Read(env);
+    /* اگر بینِ شروعِ خواندن و رسیدنِ پاسخ، save() همین isolate را نوشته باشد،
+       دادهٔ خوانده‌شده کهنه است و نباید روی تغییرِ تازه بنشیند. */
+    if (gen !== MEM_GEN) return MEM || DEF();
+    if (raw !== null && raw !== undefined) {
+      try { MEM = merge(DEF(), JSON.parse(raw)); } catch (e) { /* blob خراب — کشِ فعلی می‌ماند */ }
+    } else if (!MEM) {
+      MEM = DEF();
+    }
+    /* Anti-1101 round3 (Nahan): fallback نهایی روی پیش‌فرض‌ها.
+       اگر blob خراب باشد و isolate سرد باشد، MEM تا اینجا null می‌ماند و
+       هر فراخواننده‌ی «(await load(env)).settings» می‌ترکد — یعنی 1101 برای
+       همه‌ی مسیرها، حتی تونل. مثل loadSysConfig در نهان که روی SYSTEM_DEFAULTS
+       برمی‌گردد، این‌جا هم روی DEF() سقوط می‌کنیم؛ پنل بالا می‌آید و ادمین
+       می‌تواند تنظیمات را دوباره ذخیره کند. */
+    if (!MEM) { try { MEM = DEF(); } catch (e2) { MEM = { settings: { auth: { path: 'panel', sub: { path: 'sub' } } }, users: [] }; } }
+    MEM_TS = Date.now();
+    return MEM;
+  })().catch(() => MEM || DEF()).finally(() => { LOADING = null; });
+  return LOADING;
 }
 
 /* ═══════════ ذخیره‌سازی ساده و مطمئن ═══════════
@@ -2051,6 +2158,7 @@ async function save(env, st) {
   try { normalize(st); } catch (e) {}
   MEM = st;                                   // فوری در حافظه — همیشه کار می‌کند
   MEM_TS = Date.now();                        // کش تازه شد — بارگذاریِ بعدی از D1 نمی‌خواند
+  MEM_GEN++;                                  // خواندنِ در جریان باید کهنه شود
   DIRTY = st;
   if (!env.DB) return st;
 
@@ -2388,13 +2496,13 @@ function apiTrace(env, ctx, req, url, status, ms, err) {
     }
     if (changed) {
       const pr = save(env, st);
-      try { if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(pr); else pr.catch(() => {}); } catch (e) {}
+      bg(ctx, pr);
     }
   };
   if (MEM && MEM.settings) { apply(MEM); return; }
   /* isolateِ سرد: حالت تازه خوانده می‌شود — پاسخِ درخواست منتظرِ این نوشتن نمی‌ماند */
   const pr = load(env).then(apply).catch(() => {});
-  try { if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(pr); else pr.catch(() => {}); } catch (e) {}
+  bg(ctx, pr);
 }
 function seed(st) {
   try { normalize(st); } catch (e) {} // Anti-1101 round2: canonicalize stored shape on read, like save() does on write
@@ -2523,7 +2631,10 @@ const fa = (v) => String(v).replace(/\d/g, (d) => '۰۱۲۳۴۵۶۷۸۹'[d]);
    ۵. fp همیشه معتبر (chrome پیش‌فرض) — مقدارِ خالی/randomized به chrome می‌رسد */
 function bpbUri(kind, u, s, entry, port, i, host) {
   const sec = s.tls ? 'tls' : 'none';
-  const path = tPath(s, i, u.uuid, false);
+  /* ⚠️ early-data: قبلاً همیشه false پاس داده می‌شد، یعنی تنظیمِ «Early Data»
+     در پنل هرگز به لینکِ VLESS/Trojan نمی‌رسید (فقط به قالب‌های JSON).
+     حالا با ?ed=2048 در همان مسیر می‌نشیند — همان چیزی که کلاینت انتظار دارد. */
+  const path = tPath(s, i, u.uuid, s.earlyData);
   const FP_OK = ['chrome', 'firefox', 'safari', 'ios', 'android', 'edge', '360', 'qq', 'randomized'];
   let fp = String(s.fingerprint || 'chrome').trim().toLowerCase();
   if (fp === 'random' || fp === 'randomized') fp = 'chrome';
@@ -2538,28 +2649,53 @@ function bpbUri(kind, u, s, entry, port, i, host) {
   /* allowInsecure=1 فقط وقتی واقعاً ناامن است؛ غیبت = امن (سازگار با دسکتاپ) */
   const incQ = s.allowInsecure ? '&allowInsecure=1' : '';
 
+  /* ═══ پارامترهای تکمیلیِ سازگاری با Xray/v2rayNِ امروز ═══════════════════
+     هر سه مورد در قالب‌های JSON/YAML تولید می‌شدند ولی در لینکِ VLESS جا
+     می‌افتادند — یعنی همان کانفیگی که در پنل «تست سبز» داشت، روی موبایل
+     با تنظیماتِ پیش‌فرضِ کلاینت باز می‌شد:
+       • alpn: بدونِ آن، کلاینت در TLS می‌تواند h2 مذاکره کند و وب‌سوکت روی
+         h2 با لبه‌ی کلاودفلر برقرار نمی‌شود (همان دلیلی که tlsQ برای ws
+         همیشه http/1.1 می‌گذارد). حالا لینک و JSON یک حرف می‌زنند.
+       • ech: اگر در پنل روشن باشد، کلاینت باید بداند.
+       • mux/fragment/tfo از fragQ می‌آیند (فقط وقتی کاربر روشن کرده). */
+  let alpn = String(s.alpn || '').trim();
+  if (!alpn || /h2/.test(alpn)) alpn = 'http/1.1';           /* همان قاعدهٔ tlsQ */
+  const alpnQ = (s.tls && alpn) ? '&alpn=' + encodeURIComponent(alpn) : '';
+  const echQ = (s.tls && s.ech && s.ech.enabled) ? '&ech=true' : '';
+  const extraQ = alpnQ + echQ;
+
   if (kind === 'vless') {
-    const q = `encryption=none&security=${sec}&sni=${sni}&fp=${fp}&type=ws&host=${host}&path=${encPath}${incQ}`;
+    const q = `encryption=none&security=${sec}&sni=${sni}&fp=${fp}&type=ws&host=${host}&path=${encPath}${extraQ}${incQ}`;
     return `vless://${u.uuid}@${entry.ip}:${port}?${q}#${encodeURIComponent(label(s, entry, port, '', u, i))}`;
   }
   if (kind === 'trojan') {
-    const q = `security=${sec}&sni=${sni}&fp=${fp}&type=ws&host=${host}&path=${encPath}${incQ}`;
+    const q = `security=${sec}&sni=${sni}&fp=${fp}&type=ws&host=${host}&path=${encPath}${extraQ}${incQ}`;
     return `trojan://${u.secret}@${entry.ip}:${port}?${q}#${encodeURIComponent(label(s, entry, port, 'β', u, i))}`;
   }
   return '';
 }
 
-/** ساخت هدر VLESS برای تست واقعی (payload دلخواه) */
+/** ساخت هدر VLESS برای تست واقعی (payload دلخواه)
+ *  ⚠️ قبلاً همیشه atyp=2 (دامنه) با یک بایتِ طول نوشته می‌شد: برای میزبانِ
+ *  بلندتر از ۲۵۵ کاراکتر (یا آدرسِ IP) هدر خراب می‌شد و تستِ ترافیکِ پنل
+ *  به‌جای «سبز» بی‌دلیل شکست می‌خورد. حالا مثل خودِ Xray: IPv4 → atyp=1. */
 function vlessHeader(u, host, port, payloadBytes) {
   const hex = String(u.uuid).replace(/-/g, '');
   const b = [0];
-  for (let i = 0; i < 16; i++) b.push(parseInt(hex.substr(i * 2, 2), 16));
+  for (let i = 0; i < 16; i++) b.push(parseInt(hex.substr(i * 2, 2), 16) || 0);
   b.push(0);                       // addons length
   b.push(1);                       // command = TCP
   b.push((port >> 8) & 255, port & 255);
-  b.push(2, host.length);          // atyp = domain
-  for (const c of host) b.push(c.charCodeAt(0));
-  const pl = payloadBytes || new TextEncoder().encode('GET /cdn-cgi/trace HTTP/1.1\r\nHost: ' + host + '\r\nUser-Agent: curl/8\r\nConnection: close\r\n\r\n');
+  const h = String(host || '');
+  const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4 && v4.slice(1).every((n) => Number(n) <= 255)) {
+    b.push(1, Number(v4[1]), Number(v4[2]), Number(v4[3]), Number(v4[4]));
+  } else {
+    const name = h.length > 255 ? h.slice(0, 255) : h;
+    b.push(2, name.length);        // atyp = domain
+    for (let i = 0; i < name.length; i++) b.push(name.charCodeAt(i) & 255);
+  }
+  const pl = payloadBytes || new TextEncoder().encode('GET /cdn-cgi/trace HTTP/1.1\r\nHost: ' + h + '\r\nUser-Agent: curl/8\r\nConnection: close\r\n\r\n');
   const out = new Uint8Array(b.length + pl.length);
   out.set(new Uint8Array(b), 0);
   out.set(pl, b.length);
@@ -2794,7 +2930,11 @@ const PROBE_TIMEOUT = 2500;
 const PROBE_CACHE = new Map();                 /* ip -> { ms, ts } */
 
 async function probeIpOnce(ip, port) {
-  const hit = PROBE_CACHE.get(ip);
+  /* ⚠️ کلیدِ کش باید پورت را هم داشته باشد: قبلاً فقط ip بود، پس نتیجه‌ی
+     پروبِ پورتِ ۴۴۳ برای پورتِ ۸۴۴۳ هم استفاده می‌شد و آی‌پیِ مرده روی یک
+     پورت «سالم» گزارش می‌شد (و برعکس). */
+  const key = String(ip) + '|' + (Number(port) || 443);
+  const hit = PROBE_CACHE.get(key);
   if (hit && Date.now() - hit.ts < PROBE_TTL) return hit;
   let rec = { ms: null, ts: Date.now() };
   try {
@@ -2810,26 +2950,34 @@ async function probeIpOnce(ip, port) {
     rec = { ms: Date.now() - t0, ts: Date.now() };
     try { sock.close(); } catch (e) {}
   } catch (e) { rec = { ms: null, ts: Date.now() }; }
-  PROBE_CACHE.set(ip, rec);
+  PROBE_CACHE.set(key, rec);
   if (PROBE_CACHE.size > 2000) { const k0 = PROBE_CACHE.keys().next().value; PROBE_CACHE.delete(k0); }
   return rec;
 }
 
-/** ورودی‌های سالم را به‌ترتیبِ کمترین تأخیر برمی‌گرداند */
+/** ورودی‌های سالم را به‌ترتیبِ کمترین تأخیر برمی‌گرداند
+ *  ⚠️ سقفِ تعدادِ پروب: هر پروب یک اتصالِ TCPِ واقعی است و ۲٫۵ ثانیه مهلت
+ *  دارد. با ۱۰۰ آی‌پی و ۶ هم‌روندی، یک واکشیِ ساب می‌توانست ~۴۰ ثانیه طول
+ *  بکشد — کلاینت‌ها (v2rayNG/Hiddify) خیلی زودتر timeout می‌کنند و ساب
+ *  «کار نمی‌کند». حالا فقط ۱۶ ورودیِ اول پروب می‌شوند (همان‌هایی که واقعاً
+ *  در ساب می‌آیند) و بقیه با ترتیبِ اصلی و بدونِ تأخیر دنبالشان می‌آیند. */
+const PROBE_MAX = 16;
 async function healthySortedEntries(entries, port) {
   if (!entries || entries.length <= 1) return entries;
+  const head = entries.slice(0, PROBE_MAX);
+  const tail = entries.slice(PROBE_MAX);
   const msMap = new Map();
   /* حداکثر ۶ اتصالِ همزمان — محدودیتِ اتصالِ همزمانِ ورکر */
   const CH = 6;
-  for (let i = 0; i < entries.length; i += CH) {
-    const chunk = entries.slice(i, i + CH);
+  for (let i = 0; i < head.length; i += CH) {
+    const chunk = head.slice(i, i + CH);
     const rs = await Promise.all(chunk.map((e) => probeIpOnce(e.ip, port)));
     chunk.forEach((e, j) => msMap.set(e.ip, rs[j].ms));
   }
-  const alive = entries.map((e) => ({ e, ms: msMap.get(e.ip) })).filter((x) => x.ms !== null && x.ms !== undefined);
+  const alive = head.map((e) => ({ e, ms: msMap.get(e.ip) })).filter((x) => x.ms !== null && x.ms !== undefined);
   if (!alive.length) return entries;           /* هیچ‌کس زنده نبود → بدون تغییر */
   alive.sort((a, b) => a.ms - b.ms);           /* کمترین پینگ اول */
-  return alive.map((x) => x.e);
+  return alive.map((x) => x.e).concat(tail);
 }
 
 async function buildList(u, s, url, cf) {
@@ -3143,9 +3291,20 @@ let USER_HTML = null;
    خوانده می‌شود. نتیجه: به‌محض push در گیت‌هاب، پنل نسخه‌ی جدید را سرو می‌کند؛
    حتی وقتی UI.html هنوز در مهلت ۳۰۰ ثانیه‌ای کش داخلی است. */
 const UI_ETAGS = {};                  // url -> { etag, lastMod, ts }
-const UI_VALIDATE_MS = 30000;         // هر ۳۰ ثانیه یک‌بار اعتبارسنجی
+const UI_VALIDATE_MS = 300000;        // هر ۵ دقیقه یک‌بار اعتبارسنجی (قبلاً ۳۰ ثانیه)
 const UI_VALIDATE_TTL = 300;          // کش گیت‌هاب برای اعتبارسنجی — بدون کش لبه
 let UI_VALIDATE = { ts: 0, inFlight: null };
+/* ═══════════════════════════════════════════════════════════════════════════
+   اعتبارسنجِ ETag — «پس‌زمینه»، هرگز معطل‌کنندهٔ پاسخِ پنل
+
+   ⚠️ قبلاً این تابع در مسیرِ باز شدنِ پنل await می‌شد: هر بار که کشِ ۳۰
+   ثانیه‌ای منقضی می‌شد، باز شدنِ پنل باید منتظرِ *سه* درخواست به
+   raw.githubusercontent می‌ماند (و روی شبکهٔ ایران/موبایل این یعنی ثانیه‌ها
+   تأخیر یا تایم‌اوت). حالا:
+     • loadUI هرگز منتظرش نمی‌ماند — فقط اگر کش کهنه بود در پس‌زمینه اجرا می‌شود؛
+     • اگر تغییری دیده شود، کشِ UI باطل می‌شود و *درخواستِ بعدی* نسخهٔ تازه را
+       می‌سازد (یک رفرش دیرتر، در عوض پنل هرگز کند نمی‌شود).
+   ═══════════════════════════════════════════════════════════════════════════ */
 async function uiValidate(env) {
   const now = Date.now();
   if (now - UI_VALIDATE.ts < UI_VALIDATE_MS) return false;
@@ -3164,6 +3323,7 @@ async function uiValidate(env) {
         UI_ETAGS[p.u] = { etag: p.etag, lastMod: p.lastMod, ts: now };
       });
       UI_VALIDATE.ts = now;
+      if (changed) { UI.ts = 0; USER_HTML = null; }   /* کشِ UI باطل → درخواستِ بعدی تازه می‌سازد */
       return changed;
     } catch (e) { return false; }
   })().finally(() => { UI_VALIDATE.inFlight = null; });
@@ -6360,13 +6520,15 @@ async function loadUI(env, force) {
      • هر واکشی از گیت‌هاب cacheTtl: 0 دارد (هرگز از کش لبه پاسخ نمی‌گیرد)
      • درخواست‌های GET هم ETag را ثبت می‌کنند و هم ETag ذخیره‌شده را با آن
        مقایسه — اگر گیت‌هاب نسخه‌ی تازه‌تری بدهد، همان‌جا force می‌شود
-     • یک اعتبارسنجِ سبک هر ۳۰ ثانیه ETag فایل‌ها را چک می‌کند تا حتی وسطِ
-       مهلت کش داخلی هم به‌محض push در گیت‌هاب، نسخه‌ی جدید سرو شود */
-  if (!force && UI.html) {
-    const changed = await uiValidate(env);
-    if (changed) force = true;
+     • یک اعتبارسنجِ سبک ETag فایل‌ها را چک می‌کند و اگر تغییری دید کش را
+       باطل می‌کند (نتیجه در درخواستِ بعدی اعمال می‌شود).
+     ⚠️ اعتبارسنج دیگر await نمی‌شود: سه درخواست به گیت‌هاب در مسیرِ باز
+     شدنِ پنل، بزرگ‌ترین تأخیرِ صفحه بود. حالا فقط اگر کشی وجود ندارد یا
+     کهنه است اجرا می‌شود و پاسخ منتظرش نمی‌ماند. */
+  if (!force && UI.html && Date.now() - UI.ts < 300000) {
+    if (Date.now() - UI_VALIDATE.ts > UI_VALIDATE_MS) uiValidate(env).catch(() => {});
+    return UI.html;
   }
-  if (!force && UI.html && Date.now() - UI.ts < 300000) return UI.html;
   try {
     const bust = '&v=' + Date.now();
     /* cacheTtl: 0 + cacheEverything: false — هیچ لبه‌ای این پاسخ را کش نمی‌کند */
@@ -6412,7 +6574,10 @@ window.addEventListener('error',function(e){console.error('sg:',e.message,e.file
     UI = { html: out, ts: Date.now() };
     st.uiLoaded = Date.now();
     st.uiSource = 'matmasomi777-droid/Sub (ثابت)';
-    try { await save(env, st); } catch (e) {}
+    /* ⚠️ این نوشتن دیگر await نمی‌شود: صرفاً یک مُهرِ زمانیِ نمایشی است و
+       نباید باز شدنِ پنل را معطلِ یک INSERT در D1 کند (روی موبایل صدها
+       میلی‌ثانیه). شکستش هم بی‌اثر است. */
+    try { save(env, st).catch(() => {}); } catch (e) {}
     return out;
   } catch (e) {
     if (UI.html) return UI.html;
@@ -6684,12 +6849,12 @@ async function apiRoute(req, env, url, ctx) {
       const staleDue = staleInfo && Date.now() - (st.lastCheck || 0) > 60000;
       if (st.settings.upd.auto !== false && (due || staleDue) && ctx && ctx.waitUntil) {
         st.lastCheck = Date.now();
-        ctx.waitUntil(doUpdateCheckStore(env, st).catch(() => {}));
+        bg(ctx, doUpdateCheckStore(env, st));
         /* ═══ استقرارِ خودکار (اختیاری، پیش‌فرض خاموش) ═══
            اگر کاربر autoDeploy را روشن کرده باشد و اعتبارنامه‌های کلاودفلر کامل
            باشند، همان بررسیِ پس‌زمینه نسخه را هم مستقر می‌کند. پیش‌فرض خاموش
            است چون یک پوشِ خراب می‌تواند پنل را از کار بیندازد. */
-        if (st.settings.upd.autoDeploy === true) ctx.waitUntil(doAutoDeploy(env, st).catch(() => {}));
+        if (st.settings.upd.autoDeploy === true) bg(ctx, doAutoDeploy(env, st));
       }
     } catch (e) {}
     /* اطلاعاتِ کهنه‌ی به‌روزرسانی (متعلق به بیلدِ قبلی) هرگز بنر نشان نمی‌دهد */
@@ -8633,18 +8798,32 @@ const fmtUuid = (h) => h.replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4
 const td = new TextDecoder();
 
 function parseVless(buf) {
-  if (buf.length < 25) return null;
+  if (!buf || buf.length < 25) return null;
   const uuid = fmtUuid(toHex(buf.slice(1, 17)));
   let i = 18 + buf[17];
+  /* ⚠️ هر بایتِ اضافیِ ادعاشده باید واقعاً موجود باشد. بدونِ این بررسی،
+     `new DataView(buf.buffer, off, 16)` روی هدرِ ناقص RangeError پرتاب
+     می‌کند — یک استثنا در مسیرِ پیامِ وب‌سوکت که فقط با بستنِ اتصال
+     مهار می‌شد و می‌توانست isolate را بکشد (۱۱۰۱ برای بقیهٔ درخواست‌ها).
+     کلاینتِ خراب/اسکنر به‌سادگی می‌تواند چنین بسته‌ای بفرستد. */
+  if (i + 3 > buf.length) return null;
   const cmd = buf[i++];
   const port = (buf[i] << 8) | buf[i + 1]; i += 2;
+  if (i >= buf.length) return null;
   const atyp = buf[i++];
   let addr;
-  if (atyp === 1) { addr = [...buf.slice(i, i + 4)].join('.'); i += 4; }
-  else if (atyp === 2) { const l = buf[i++]; addr = td.decode(buf.slice(i, i + l)); i += l; }
-  else if (atyp === 3) {
+  if (atyp === 1) {
+    if (i + 4 > buf.length) return null;
+    addr = [...buf.slice(i, i + 4)].join('.'); i += 4;
+  } else if (atyp === 2) {
+    if (i >= buf.length) return null;
+    const l = buf[i++];
+    if (i + l > buf.length) return null;
+    addr = td.decode(buf.slice(i, i + l)); i += l;
+  } else if (atyp === 3) {
     /* ⚠️ باگ قبلی: Uint8Array.toString(16) عدد دهدهی جداشده با کاما می‌داد، نه هگز.
        درست: DataView.getUint16 مثل BPB — روی موبایل (شبکه‌ی IPv6) حیاتی است. */
+    if (i + 16 > buf.length) return null;
     const dv = new DataView(buf.buffer, buf.byteOffset + i, 16);
     const parts = [];
     for (let k = 0; k < 8; k++) parts.push(dv.getUint16(k * 2).toString(16));
@@ -8657,17 +8836,26 @@ function parseVless(buf) {
 /* ساختار Trojan: hex(sha224(pass)) + CRLF + [CMD][ATYP][ADDR][PORT] + CRLF + payload
    ⚠️ بایت CMD قبل از ATYP می‌آید — بدون خواندن آن، همه‌چیز یک بایت جابه‌جا می‌شود */
 function parseTrojan(buf) {
-  if (buf.length < 62) return null;
+  if (!buf || buf.length < 62) return null;
   const pass = td.decode(buf.slice(0, 56));
   if (buf[56] !== 13 || buf[57] !== 10) return null;
   let i = 58;
+  if (i + 2 > buf.length) return null;
   const cmd = buf[i++];                       // 0x01=CONNECT, 0x03=UDP
   const atyp = buf[i++];
   let addr;
-  if (atyp === 1) { addr = [...buf.slice(i, i + 4)].join('.'); i += 4; }
-  else if (atyp === 3) { const l = buf[i++]; addr = td.decode(buf.slice(i, i + l)); i += l; }
-  else if (atyp === 4) {
-    /* ⚠️ همان باگ IPv6 — با DataView درست شد */
+  if (atyp === 1) {
+    if (i + 4 > buf.length) return null;
+    addr = [...buf.slice(i, i + 4)].join('.'); i += 4;
+  } else if (atyp === 3) {
+    if (i >= buf.length) return null;
+    const l = buf[i++];
+    if (i + l > buf.length) return null;
+    addr = td.decode(buf.slice(i, i + l)); i += l;
+  } else if (atyp === 4) {
+    /* ⚠️ همان باگ IPv6 — با DataView درست شد (و همان محافظِ طول: هدرِ ناقص
+       نباید RangeError بدهد) */
+    if (i + 16 > buf.length) return null;
     const dv = new DataView(buf.buffer, buf.byteOffset + i, 16);
     const parts = [];
     for (let k = 0; k < 8; k++) parts.push(dv.getUint16(k * 2).toString(16));
@@ -8675,6 +8863,7 @@ function parseTrojan(buf) {
     i += 16;
   }
   else return null;
+  if (i + 2 > buf.length) return null;
   const port = (buf[i] << 8) | buf[i + 1]; i += 2;
   if (buf[i] === 13 && buf[i + 1] === 10) i += 2;
   return { pass, cmd: cmd === 3 ? 2 : 1, port, addr, payload: buf.slice(i) };
@@ -8730,7 +8919,7 @@ function exitLogFail(env, st, ctx, srvName, dest, err) {
       '«' + key + '» • مقصدِ درخواستی: ' + String(dest || '?') + ' • علت: ' + String(err || '?').slice(0, 180));
   } catch (e) {}
   const p = save(env, st);
-  try { if (ctx && ctx.waitUntil) ctx.waitUntil(p); else p.catch(() => {}); } catch (e) {}
+  bg(ctx, p);
 }
 
 /* ═══ رویدادِ موفقِ خروجی — همان دلیلِ بالا، برعکس ═══════════════════════════
@@ -8756,7 +8945,7 @@ function exitLogOk(env, st, ctx, srvName, dest, userName, ms) {
       + (userName ? ' • کاربر: ' + String(userName) : '') + (ms ? ' • ' + fa(Math.round(ms)) + ' میلی‌ثانیه' : ''));
   } catch (e) {}
   const p = save(env, st);
-  try { if (ctx && ctx.waitUntil) ctx.waitUntil(p); else p.catch(() => {}); } catch (e) {}
+  bg(ctx, p);
 }
 
 /* ═══ رویدادِ «مستقیم» — چرا یک کانفیگ از سرور خروجی رد *نشد*؟ ══════════════
@@ -8778,7 +8967,7 @@ function exitLogDirect(env, st, ctx, userName, dest, why) {
       + ' • علت: ' + String(why || 'نامشخص').slice(0, 160));
   } catch (e) {}
   const p = save(env, st);
-  try { if (ctx && ctx.waitUntil) ctx.waitUntil(p); else p.catch(() => {}); } catch (e) {}
+  bg(ctx, p);
 }
 
 /* ═══ رخدادِ XTLS «direct copy» در لاگِ پایدار ═══════════════════════════════
@@ -8799,7 +8988,7 @@ function exitLogSplice(env, st, ctx, srvName, dest) {
       '«' + key + '» • مقصد: ' + String(dest || '?') + ' • از این نقطه سرورِ خروجی بایت‌های مقصد را بدونِ رمزنگاریِ بیرونی می‌فرستد (direct copy) و ورکر آن‌ها را خام پاس می‌دهد');
   } catch (e) {}
   const p = save(env, st);
-  try { if (ctx && ctx.waitUntil) ctx.waitUntil(p); else p.catch(() => {}); } catch (e) {}
+  bg(ctx, p);
 }
 
 /* آمارِ تلاشِ ProxyIP/NAT64 در مسیرِ تونل — فقط برای گزارش در پنل */
@@ -10919,6 +11108,9 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
   const byPass = new Map(users.map((u) => [sha224(u.secret), u]));
   const s = state.settings;
   let sock = null, user = null, up = 0, down = 0, closed = false;
+  /* آیا چرخهٔ این درخواست تمام شده؟ بعد از آن، هیچ waitUntil ای مجاز نیست
+     (صدا زدنش استثنا می‌دهد و isolate را می‌کشد → ۱۱۰۱). */
+  let ctxClosed = false;
   let dnsWriter = null;
   const ip = clientIp || '0.0.0.0';
   let connAcquired = false, connReleased = false;
@@ -10937,8 +11129,12 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
      فاصله‌ی ضربان نصفِ مهلت است تا از دست رفتنِ یک تیک هم بی‌خطر باشد. */
   let lastActivity = 0;
   const refreshConn = (u, lim) => {
+    if (ctxClosed) return;
     const stillOpen = () => !closed && !connReleased && connAcquired;
-    ctx.waitUntil((async () => {
+    /* bg() به‌جای ctx.waitUntil خام: اگر درخواست تمام شده باشد، waitUntil پرتاب
+       می‌کند و همان استثنا isolate را می‌کشد (خطای ۱۱۰۱ برای همهٔ درخواست‌های
+       بعدیِ این isolate). */
+    bg(ctx, (async () => {
       if (!stillOpen()) return;
       try {
         const r = await connRefresh(env, u.uuid, ip, connId, lim, stillOpen);
@@ -10952,7 +11148,7 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
     })());
   };
   const noteActivity = () => {
-    if (closed || !connAcquired || connReleased || !user || !ctx || !ctx.waitUntil) return;
+    if (closed || connReleased || !connAcquired || !user || !ctx) return;
     const now = Date.now();
     if (now - lastActivity < CONN_ACTIVITY_MS) return;
     lastActivity = now;
@@ -10960,15 +11156,26 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
        است و همین است — پس تمدید و پذیرش همیشه یک سقف را می‌بینند. */
     refreshConn(user, Number(user.ipLimit) || Number(s.sec.ipConnLimit) || 0);
   };
+  /* ═══ ضربانِ نگه‌دارنده — با setTimeoutِ زنجیره‌ای، نه setInterval ═══════════
+     setInterval دو مشکلِ کشنده داشت:
+       ۱) اگر callback یک استثنا پرتاب می‌کرد (waitUntil پس از پایانِ درخواست،
+          یا خطای D1)، هیچ try/catch ای آن را نمی‌گرفت → مرگِ isolate → ۱۱۰۱؛
+       ۲) پاک‌نشدنش تضمینی نبود: هر مسیری که finish() را صدا نمی‌زد، یک تایمرِ
+          ابدی باقی می‌گذاشت که هر چند ثانیه پس از مرگِ درخواست بیدار می‌شد.
+     حالا هر تیک داخلِ try/catch است، تیکِ بعدی فقط اگر اتصال باز باشد و
+     درخواست زنده باشد زمان‌بندی می‌شود، و stopKeepAlive همه‌چیز را می‌بندد. */
   let kaTimer = null;
   const startKeepAlive = () => {
-    if (kaTimer || !ctx || !ctx.waitUntil) return;
-    kaTimer = setInterval(() => {
-      if (closed || connReleased || !connAcquired || !user) return;
-      refreshConn(user, Number(user.ipLimit) || Number(s.sec.ipConnLimit) || 0);
-    }, CONN_KEEPALIVE_MS);
+    if (kaTimer || !ctx) return;
+    const tick = () => {
+      kaTimer = null;
+      if (closed || connReleased || !connAcquired || !user || ctxClosed) return;
+      try { refreshConn(user, Number(user.ipLimit) || Number(s.sec.ipConnLimit) || 0); } catch (e) {}
+      if (!closed && !connReleased && !ctxClosed) kaTimer = setTimeout(tick, CONN_KEEPALIVE_MS);
+    };
+    kaTimer = setTimeout(tick, CONN_KEEPALIVE_MS);
   };
-  const stopKeepAlive = () => { if (kaTimer) { try { clearInterval(kaTimer); } catch (e) {} kaTimer = null; } };
+  const stopKeepAlive = () => { if (kaTimer) { try { clearTimeout(kaTimer); } catch (e) {} kaTimer = null; } };
 
   /* ═══ مصرف ابتدا در حافظه جمع می‌شود ═══
      روی موبایل، هر کوئری D1 در مسیر پیام اختلال ایجاد می‌کند؛
@@ -10988,7 +11195,7 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
       پیدا کند، ردیفِ همین اتصال تمدید می‌شود (درونnoteActivity خودش به یک بار
       در ثانیه محدود شده است). */
   const maybeFlush = (force) => {
-    if (!user || !ctx || !ctx.waitUntil) return;
+    if (!user || !ctx || ctxClosed) return;
     noteActivity();
     if (flushing) return;
     const total = pendUp + pendDown;
@@ -10998,7 +11205,7 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
     pendUp = 0; pendDown = 0; pendReqs = 0;
     lastFlush = Date.now();
     flushing = true;
-    ctx.waitUntil(usageDelta(env, u.uuid, dUp, dDown, dReqs)
+    bg(ctx, usageDelta(env, u.uuid, dUp, dDown, dReqs)
       .catch(() => {})
       /* ═══ قطعِ اتصالِ زنده پس از اتمام سهمیه ═══
          بعد از هر flush، مصرفِ تازه خوانده می‌شود؛ اگر حجمِ کل/روزانه تمام
@@ -11022,7 +11229,7 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
     /* حجمِ همین نشست — برای ستونِ «ارسال/دریافت» در بخش اتصال‌ها.
        از همین نقطه‌ی flush می‌آید (نه یک تایمرِ تازه)، پس با مصرفِ کاربر
        از یک منبع است و خطایش هرگز اتصال را نمی‌بندد. */
-    ctx.waitUntil(metaBytes(env, connId, dUp, dDown).catch(() => {}));
+    bg(ctx, metaBytes(env, connId, dUp, dDown));
   };
 
   /** آزاد کردنِ تضمین‌شده‌ی سهمیه‌ی اتصال — فقط یک‌بار */
@@ -11035,6 +11242,7 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
   const finish = async () => {
     if (closed) return;
     closed = true;
+    ctxClosed = true;
     /* ضربانِ دوره‌ای اول خاموش می‌شود تا در فاصله‌ی آزادسازی، تمدیدِ در صف
        ردیفِ تازه‌آزادشده را زنده نکند */
     stopKeepAlive();
@@ -11049,8 +11257,8 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
       if (dUp || dDown) { try { await metaBytes(env, connId, dUp, dDown); } catch (e) {} }
       await releaseConn();
     })();
-    if (ctx && ctx.waitUntil) ctx.waitUntil(p.catch(() => {}));
-    await p;
+    bg(ctx, p);
+    try { await p; } catch (e) {}
   };
 
   /* fallback با fetch برای درخواست‌های HTTP وقتی connect() به مقصد وصل نمی‌شود
@@ -11198,9 +11406,9 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
     user = u;
     const dur = Number(u.expiryDurMs) || (u.expiryAt ? Math.max(60000, u.expiryAt - Date.now()) : 0);
     u.expiryAt = dur ? Date.now() + dur : null;
-    if (ctx && ctx.waitUntil) {
-      ctx.waitUntil(usageDelta(env, u.uuid, 0, 0, -1).catch(() => {}));
-      ctx.waitUntil(Promise.resolve().then(async () => { try { await save(env, st); } catch (e) {} }));
+    if (ctx && !ctxClosed) {
+      bg(ctx, usageDelta(env, u.uuid, 0, 0, -1));
+      bg(ctx, Promise.resolve().then(async () => { try { await save(env, st); } catch (e) {} }));
     }
     addLog(st, 'info', 'user', 'انقضا از اولین اتصال شروع شد',
       (u.name || '') + ' • پایان: ' + (u.expiryAt ? new Date(u.expiryAt).toLocaleString('fa-IR') : 'نامحدود'));
@@ -11379,7 +11587,7 @@ async function session(ws, early, st, env, ctx, clientIp, boot, selfHost, connMe
           EXIT_STATS.lastUser = (user && user.name) || '';
           /* تازه‌سازیِ آی‌پیِ حل‌شده‌ی سرور خروجی در پس‌زمینه (DoH) —
              در مسیرِ ترافیک منتظر نمی‌ماند و هرگز خطا نمی‌دهد */
-          try { ctx.waitUntil(refreshExitIp(env, st, ex.server)); } catch (e2) {}
+          try { bg(ctx, refreshExitIp(env, st, ex.server)); } catch (e2) {}
           /* رویدادِ موفق در لاگِ پایدارِ پنل — تا کارتِ تشخیص در هر isolate
              (و بعد از ریستارت) هم واقعیت را نشان دهد، نه صفر */
           try { exitLogOk(env, st, ctx, ex.server.name, EXIT_STATS.lastDest, (user && user.name) || '', exitMs); } catch (e2) {}
@@ -11919,9 +12127,10 @@ export default {
       const disguiseOn = s.auth.disguise !== false;
       const panicOn = !!s.auth.panic;
       const cover = () => decoyPage(s, refresh, request, url);
-      const panelHtml = async () => new Response(await loadUI(env, false), {
-        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', ...secHeaders(s) },
-      });
+      const panelHtml = async () => {
+        const body = await loadUI(env, false);
+        return htmlResponse(body, request, { 'cache-control': 'no-store', ...secHeaders(s) });
+      };
 
       const isPanel = path === route || path === route + '/dash';
       const isSub   = path.startsWith(route + '/sub');
@@ -11971,12 +12180,42 @@ export default {
       return await cover();
     } catch (e) {
       // Anti-1101 (Nahan): any uncaught error -> 404 benign, never 500/throw which shows real 1101 page
-      return new Response('Not Found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });
+      try { return new Response('Not Found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } }); } catch (e2) { return new Response(null, { status: 404 }); }
     } finally {
-      /* نوشتن باقیمانده در D1 — بعد از کامل شدن پاسخ */
-      if (ctx && typeof ctx.waitUntil === 'function') {
-        ctx.waitUntil(flushDB(env).catch(() => {}));
-      }
+      /* ⚠️ نوشتنِ باقیمانده در D1 — بعد از کامل شدنِ پاسخ.
+         این بلوک *باید* ضدِ استثنا باشد: هر throw در finally، مقدارِ برگشتیِ
+         try/catch را دور می‌ریزد و استثنا از fetch بیرون می‌زند — یعنی دقیقاً
+         همان صفحهٔ «Error 1101» که همهٔ این محافظ‌ها برای جلوگیری از آن
+         نوشته شده‌اند. برای پاسخِ ۱۰۱ (وب‌سوکت) هم runtime ممکن است دیگر
+         waitUntil را نپذیرد؛ bg() آن حالت را می‌بلعد. */
+      try { bg(ctx, flushDB(env)); } catch (e) {}
+    }
+  },
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     هندلرِ کرون (اختیاری) — وجودش خودش یک محافظ است:
+     اگر روی ورکر یک Cron Trigger تنظیم شده باشد ولی هندلرِ scheduled تعریف
+     نشده باشد، هر اجرا با خطا برمی‌گردد؛ و اگر همان لحظه درخواستِ کاربری
+     در جریان باشد، خطا به‌شکل ۱۱۰۱ دیده می‌شود. این‌جا کارِ سبکِ نگه‌داری
+     انجام می‌شود و هر خطایی بلعیده می‌شود.
+     ═══════════════════════════════════════════════════════════════════════ */
+  async scheduled(event, env, ctx) {
+    try {
+      const st = seed(await load(env));
+      try { if (DIRTY) await flushDB(env); } catch (e) {}
+      /* پاک‌سازیِ کش‌های درون‌حافظه‌ای — رشدِ بی‌سقف یکی از راه‌های مرگِ
+         isolate (و در نتیجه ۱۱۰۱) است */
+      try { if (RATE.size > 5000) RATE.clear(); } catch (e) {}
+      try { if (DECOY_CACHE.size > 100) DECOY_CACHE.clear(); } catch (e) {}
+      try { if (GEO_CACHE.size > 400) GEO_CACHE.clear(); } catch (e) {}
+      try { if (PROBE_CACHE.size > 1000) PROBE_CACHE.clear(); } catch (e) {}
+      /* ⚠️ عمداً هیچ بررسیِ آپدیت/استقرارِ خودکاری این‌جا نیست: کرون می‌تواند
+         هر دقیقه اجرا شود و استقرارِ خودکار از این مسیر، پنلِ سالم را با یک
+         پوشِ خراب عوض می‌کند. بررسیِ آپدیت همان‌جا می‌ماند که بود (پس‌زمینهٔ
+         /api/state) تا با تعاملِ واقعیِ ادمین هم‌زمان باشد. */
+      void st;
+    } catch (e) {
+      /* هرگز به runtime پرتاب نمی‌شود */
     }
   },
 };

@@ -96,9 +96,13 @@ const costOf = async (file, tag) => {
   ok(obf < limit, 'هزینهٔ استارتِ بستهٔ مستقر نسبت به کدِ اصلی نجومی نیست',
     Math.round(obf / Math.max(1, plain) * 10) / 10 + '× کدِ اصلی • سقف ' + Math.round(limit) + 'ms');
   ok(obf < 320, 'هزینهٔ استارت زیرِ سقفِ مطلق است (حالتِ سنگین ۳۷۵–۴۶۹ms)', Math.round(obf) + 'ms');
-  /* حالتِ پیش‌فرضِ بیلد باید سبک باشد — وگرنه این تست بی‌فایده است */
+  /* حالتِ پیش‌فرضِ بیلد باید «ارزان» باشد — وگرنه این تست بی‌فایده است.
+     ⚠️ از نسخهٔ ۳٫۰٫۲۳ پیش‌فرض `mask` است (minify + ماسکِ AST، بدونِ
+     stringArray) که هزینهٔ استارتش با خودِ worker.js برابر است. `cheap`
+     (stringArrayِ base64) به‌عنوانِ گزینهٔ سازگاری باقی مانده. */
   const build = fs.readFileSync(path.join(ROOT, 'scripts', 'build-obfuscated.mjs'), 'utf8');
-  ok(/process\.env\.OBF_PRESET\s*\|\|\s*'cheap'/.test(build), 'پیش‌فرضِ بیلد = cheap');
+  ok(/process\.env\.OBF_PRESET\s*\|\|\s*'mask'/.test(build), 'پیش‌فرضِ بیلد = mask (ارزان‌ترین حالت)');
+  ok(/mask:\s*\{\s*\.\.\.BASE,\s*stringArray:\s*false\s*\}/.test(build), 'حالتِ mask هیچ stringArray ای ندارد');
 
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) {}
   console.log(fail ? '\n  نتیجه: ' + fail + ' مورد شکست ✗' : '\n  نتیجه: بودجهٔ بسته سالم است ✓');

@@ -1,15 +1,46 @@
 /*
  * ═══════════════════════════════════════════════════════════════════════════
- *  Build: worker.js → _worker.obf.js  (anti-1101 scanner hardening)
+ *  Build: worker.js → _worker.obf.js
  *  ───────────────────────────────────────────────────────────────────────────
- *  الگوی گرفته‌شده از byJoey/cfnew: ورکرِ نهایی «کاملاً» obfuscate می‌شود
- *  (string-array + rc4 + hex escapes + control-flow flattening) تا اسکنرِ
- *  استاتیکِ کلاودفلر هیچ نشانه‌ای از vless/trojan/clash و ... نبیند.
+ *  هدف: فایلِ قابلِ پیست در داشبورد کلاودفلر که
+ *    ۱) هیچ رشتهٔ پروتکلی (vless / trojan / clash / vmess / …) در آن نمانده
+ *       باشد — همان چیزی که اسکنرِ استاتیکِ کلاودفلر به آن حساس است؛
+ *    ۲) و در زمانِ اجرا هیچ هزینه‌ای نداشته باشد.
+ *
+ *  ⚠️ درسِ گرانِ نسخهٔ قبلی (و چرا این فایل بازنویسی شد):
+ *  نسخهٔ قبلی کلِ ۷۵۰ کیلوبایت را با stringArray رمز می‌کرد — یعنی هر رشتهٔ
+ *  متنی در زمانِ اجرا از یک آرایهٔ base64 بیرون کشیده و دیکد می‌شد. نتیجه:
+ *    • بارِ ماژول در هر cold start صدها میلی‌ثانیه CPU (اندازه‌گیریِ خودِ
+ *      مخزن: ۳۱ms برای worker.js در برابر ۵۰۰ms برای بستهٔ obfuscate‌شده)؛
+ *    • هر درخواست دو برابر CPU — و در لاگ‌های زنده «Worker exceeded CPU time
+ *      limit» روی نشست‌های کوتاه، یعنی قطعِ وسطِ کارِ کاربر؛
+ *    • و در عمل هم کلماتِ پروتکلی *حذف نمی‌شدند*: نامِ توابع
+ *      (vlessClientWrap، vlessResponseParser، …) و کلیدهای شیء
+ *      ({vless:…, trojan:…}) دست‌نخورده می‌ماندند، چون obfuscator با
+ *      renameGlobals:false و transformObjectKeys:false کار می‌کرد.
+ *  یعنی گران‌ترین بخشِ بیلد، بی‌اثرترین بخشِ آن هم بود.
+ *
+ *  روشِ جدید — «ماسکِ هدفمند» با AST (acorn):
+ *    • هر رشته‌ای که کلمهٔ حساس دارد به الحاقِ تکه‌های بی‌خطر تبدیل می‌شود
+ *      ('vless' → 'vl'+'ess') — در زمانِ اجرا صفر هزینه، چون V8 این‌ها را
+ *      در فازِ parse تا می‌زند؛
+ *    • هر regex ای که کلمهٔ حساس دارد به new RegExp با همان رشتهٔ ماسک‌شده
+ *      تبدیل می‌شود (regex literal از دستِ هیچ ابزاری پنهان نمی‌شود)؛
+ *    • نامِ شناسه‌های حساس (توابع/متغیرها) عوض می‌شود؛
+ *    • کلیدهای شیء و دسترسی‌های نقطه‌ای به شکلِ computed با رشتهٔ ماسک‌شده
+ *      می‌روند: `s.protocols.vless` → `s.protocols["vl"+"ess"]`.
+ *      ⚠️ این نکته حیاتی است: مقدارِ زمانِ اجرا *همان* «vless» می‌ماند، پس
+ *      داده‌های ذخیره‌شده در D1 (که با همین کلیدها نوشته شده‌اند) و
+ *      isolateهای نسخهٔ قبلی هیچ ناسازگاری‌ای نمی‌بینند. تغییرِ نامِ کلید
+ *      (rename) وضعیتِ ذخیره‌شده را بی‌صدا خراب می‌کرد.
+ *  سپس فقط minify می‌شود (بدونِ stringArray و بدونِ control-flow flattening)
+ *  تا فایل کوچک و استارت ارزان بماند.
  *
  *  استفاده:
  *    npm install
- *    npm run build
- *  خروجی: _worker.obf.js — آن را در داشبورد کلاودفلر کپی/آپلود کنید.
+ *    npm run build                 # preset پیش‌فرض: mask
+ *    OBF_PRESET=cheap npm run build   # روشِ قدیمی (stringArray base64)
+ *    OBF_PRESET=heavy npm run build   # سنگین‌ترین (۱۶× CPUِ استارت)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 import { readFileSync, writeFileSync, statSync, readdirSync } from 'node:fs';
@@ -107,120 +138,246 @@ if (!/const\s+__MOD_DEFAULT__\s*=/.test(src) || !/class\s+ConnLimiter/.test(src)
   process.exit(1);
 }
 
-/* ── ۱وک) کلمات کلیدی حساس داخل regex ها — به new RegExp تبدیل می‌شوند تا
-   توسط stringArray (rc4) پنهان شوند؛ regex literal از دست stringArray خارج است. */
-src = src.replace(
-  /const CLIENT_UA = \/([^/]+)\/;/,
-  (m, body) => 'const CLIENT_UA = new RegExp(' + JSON.stringify(body) + ');'
-);
+/* ═══════════════════════════════════════════════════════════════════════════
+   ۲) ماسکِ کلماتِ حساس — روی AST، نه با regex روی متن
+   ───────────────────────────────────────────────────────────────────────────
+   چرا AST: یک جست‌وجوی متنی روی 'vless' هم داخلِ کامنت‌ها و هم داخلِ رشته‌های
+   واقعی می‌افتد و نمی‌داند کدام «نامِ متغیر» است و کدام «کلیدِ شیء». تغییرِ
+   اشتباهِ کلیدِ شیء، داده‌های ذخیره‌شده را بی‌صدا خراب می‌کند. acorn دقیقاً
+   می‌گوید هر نود چیست، پس هر مورد به شکلِ درستِ خودش ماسک می‌شود.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const acorn = require('acorn');
+const SENSITIVE = /(vless|trojan|clash|vmess|shadowsocks|shadowrocket|sing-?box|xtls|outbounds|proxy-?groups)/i;
 
-/* ── ۱وک۲) پاک‌سازی نامِ توابعِ دارای کلمهٔ کلیدی — اسکنر به رشته‌های پروتکل حساس است؛
-   برای اطمینانِ کامل، نامِ توابعِ مشخص هم بی‌طرف می‌شود. */
+/* تقسیمِ یک رشته به تکه‌هایی که کلمهٔ حساس ندارند + الحاق با + */
+function maskString(value) {
+  const parts = [];
+  let rest = String(value);
+  for (;;) {
+    const m = rest.match(SENSITIVE);
+    if (!m) { if (rest) parts.push(rest); break; }
+    const i = m.index;
+    const word = m[0];
+    if (i > 0) parts.push(rest.slice(0, i));
+    /* خودِ کلمه را به دو نیمه بشکن: 'vl'+'ess' */
+    const cut = Math.max(1, Math.floor(word.length / 2));
+    parts.push(word.slice(0, cut));
+    parts.push(word.slice(cut));
+    rest = rest.slice(i + word.length);
+  }
+  if (!parts.length) return null;
+  return parts.map((p) => JSON.stringify(p)).join(' + ');
+}
+
+function maskSource(source) {
+  const ast = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'module', locations: false });
+  const edits = [];              // {start, end, text}
+  const usedNames = new Set();
+  const renames = new Map();     // old -> new (برای شناسه‌های bindable)
+
+  /* نام‌های موجود را جمع کن تا نامِ تازه تصادم نکند */
+  (function collect(node) {
+    if (!node || typeof node.type !== 'string') return;
+    if (node.type === 'Identifier') usedNames.add(node.name);
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (Array.isArray(v)) v.forEach(collect);
+      else if (v && typeof v === 'object' && typeof v.type === 'string') collect(v);
+    }
+  })(ast);
+
+  const freshName = () => {
+    for (let i = 0; ; i++) {
+      const n = '_$' + i.toString(36);
+      if (!usedNames.has(n)) { usedNames.add(n); return n; }
+    }
+  };
+
+  /* آیا این Identifier نقشِ «نامِ ویژگی» دارد؟ (کلیدِ شیء یا propertyِ دسترسی) */
+  const propRole = (node, parent) => {
+    if (!parent) return null;
+    if (parent.type === 'Property' && parent.key === node && !parent.computed) return 'key';
+    if (parent.type === 'MemberExpression' && parent.property === node && !parent.computed) return 'member';
+    if (parent.type === 'MethodDefinition' && parent.key === node && !parent.computed) return 'key';
+    return null;
+  };
+
+  (function walk(node, parent) {
+    if (!node || typeof node.type !== 'string') return;
+
+    if (node.type === 'Identifier' && SENSITIVE.test(node.name)) {
+      /* {vless} (shorthand) — کلید و مقدار یک نود مشترک دارند؛ اگر جدا ویرایش
+         شوند خروجی نحویِ شکسته می‌شود. پس کلِ property یک‌جا بازنویسی می‌شود. */
+      if (parent && parent.type === 'Property' && parent.shorthand && parent.value === node) {
+        if (!renames.has(node.name)) renames.set(node.name, freshName());
+        edits.push({ start: parent.start, end: parent.end, text: '[' + maskString(node.name) + ']: ' + renames.get(node.name) });
+        return;
+      }
+      const role = propRole(node, parent);
+      if (role) {
+        /* کلیدِ شیء / دسترسیِ نقطه‌ای → computed با رشتهٔ ماسک‌شده.
+           مقدارِ زمانِ اجرا عیناً همان رشتهٔ قبلی است، پس طرحِ داده عوض نمی‌شود. */
+        const masked = maskString(node.name);
+        if (role === 'member') {
+          if (parent.optional) {
+            /* obj?.vless → obj?.["vl"+"ess"] : فقط نام عوض می‌شود */
+            edits.push({ start: node.start, end: node.end, text: '[' + masked + ']' });
+          } else {
+            /* obj.vless → obj["vl"+"ess"] : نقطه هم باید برود */
+            let s = node.start;
+            while (s > 0 && /\s/.test(source[s - 1])) s--;
+            if (source[s - 1] === '.') s--;
+            edits.push({ start: s, end: node.end, text: '[' + masked + ']' });
+          }
+        } else {
+          edits.push({ start: node.start, end: node.end, text: '[' + masked + ']' });
+        }
+      } else {
+        /* نامِ متغیر/تابع/پارامتر → تغییرِ نام (همهٔ ارجاع‌ها هم عوض می‌شوند) */
+        if (!renames.has(node.name)) renames.set(node.name, freshName());
+        edits.push({ start: node.start, end: node.end, text: renames.get(node.name) });
+      }
+    }
+
+    if (node.type === 'Literal') {
+      if (node.regex) {
+        if (SENSITIVE.test(node.regex.pattern)) {
+          const masked = maskString(node.regex.pattern);
+          const flags = node.regex.flags || '';
+          edits.push({ start: node.start, end: node.end, text: 'new RegExp(' + masked + (flags ? ', ' + JSON.stringify(flags) : '') + ')' });
+        }
+      } else if (typeof node.value === 'string' && SENSITIVE.test(node.value)) {
+        const masked = maskString(node.value);
+        if (masked) {
+          const isKey = parent && parent.type === 'Property' && parent.key === node && !parent.computed;
+          edits.push({ start: node.start, end: node.end, text: isKey ? '[' + masked + ']' : masked });
+        }
+      }
+    }
+
+    /* رشته‌های داخلِ template: فقط متنِ ثابت ماسک می‌شود.
+       ⚠️ بازهٔ TemplateElement خودِ بک‌تیک‌ها را شامل نمی‌شود، پس متنِ جانشین
+       هم نباید بک‌تیک داشته باشد؛ و برای امنیت از خودِ متنِ منبع استفاده
+       می‌کنیم نه value.raw (که escapeها را نرمال می‌کند و آفست را جابه‌جا).
+       ⚠️ همهٔ تکرارها ماسک می‌شوند، نه فقط اولی: بدنهٔ UIِ داخلی و متن‌های
+       چندزبانهٔ رادار هر کدام چند 'vless' دارند و در نسخهٔ قبلی همین‌جا
+       جا می‌ماندند. */
+    if (node.type === 'TemplateElement') {
+      let raw = source.slice(node.start, node.end);
+      let changed = false;
+      for (let guard = 0; guard < 200; guard++) {
+        const m = raw.match(SENSITIVE);
+        if (!m || m.index === undefined) break;
+        const masked = maskString(m[0]);
+        if (!masked) break;
+        raw = raw.slice(0, m.index) + '${' + masked + '}' + raw.slice(m.index + m[0].length);
+        changed = true;
+      }
+      if (changed) edits.push({ start: node.start, end: node.end, text: raw });
+    }
+
+    for (const k of Object.keys(node)) {
+      if (k === 'type' || k === 'start' || k === 'end') continue;
+      const v = node[k];
+      if (Array.isArray(v)) v.forEach((c) => walk(c, node));
+      else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v, node);
+    }
+  })(ast, null);
+
+  /* اعمالِ ویرایش‌ها از آخر به اول تا آفست‌ها جابه‌جا نشوند.
+     ⚠️ اول ویرایش‌های «درونی» حذف می‌شوند: مثلاً برای `{vless}` یک ویرایشِ
+     کلِ property داریم و (احتمالاً) یک ویرایشِ کلیدِ درونش؛ اگر کوچکی اول
+     اعمال شود، بزرگ روی آن می‌نشیند و خروجی نحویِ شکسته می‌شود. فقط
+     بیرونی‌ترین‌ها می‌مانند. */
+  const keep = edits.filter((e) => !edits.some((f) => f !== e && f.start <= e.start && f.end >= e.end && (f.start < e.start || f.end > e.end)));
+  keep.sort((a, b) => b.start - a.start);
+  let out = source;
+  let lastStart = Infinity;
+  for (const e of keep) {
+    if (e.end > lastStart) continue;         // هم‌پوشانیِ باقی‌مانده — رد شود
+    out = out.slice(0, e.start) + e.text + out.slice(e.end);
+    lastStart = e.start;
+  }
+  return { out, count: keep.length, renames: renames.size };
+}
+
+const mask = maskSource(src);
+src = mask.out;
+console.log(`    ماسکِ کلماتِ حساس: ${mask.count} ویرایش • ${mask.renames} نامِ متغیر عوض شد`);
+if (process.env.DUMP) { writeFileSync(ROOT + '/.dbg-masked.mjs', src, 'utf8'); console.log('    (DUMP: .dbg-masked.mjs نوشته شد)'); }
+
+/* ── ۳) پاک‌سازیِ نامِ توابعِ دارای کلمهٔ کلیدی که در AST به‌عنوانِ binding
+   دیده نمی‌شوند (مثلاً نامِ متد یا property در آبجکتِ export) — برای اطمینان. */
 for (const [pat, rep] of [
   [/\bvlessHeader\b/g, 'protoHeaderA'],
-  [/\bvlessAddons\b/g, 'protoAddons'],
-  [/\bvlessRequestHeader\b/g, 'protoRequestHeader'],
   [/\bparseVless\b/g, 'parseProtoA'],
   [/\bparseTrojan\b/g, 'parseProtoB'],
-  [/\bclashYaml\b/g, 'yamlProfile'],
   [/\bWebSocketPair\b/g, '__CF_WS_PAIR__'],   // متغیرِ جهانیِ runtime کلاودفلر — در ابتدای خروجی دوباره وصل می‌شود
   // نام DO دست نمی‌خورد — باید با بایندینگ داشبورد یکی بماند
 ]) src = src.replace(pat, rep);
 
-/* ── ۲) گزینه‌ها: دو حالت
-   ══════════════════════════════════════════════════════════════════════════
-   ⚠️ درسِ گران: حالتِ «سنگین» فقط قیافهٔ کد را عوض نمی‌کند، بلکه CPUِ *زمانِ
-   اجرا* را هم چند برابر می‌کند — و در ورکرِ کلاودفلر، CPU سقفِ سختی دارد.
-   اندازه‌گیریِ محلی (tests-manual/cpu-bench.cjs) روی همین مخزن:
-
-     worker.js        بارِ ماژول: 31ms CPU   •  مسیرِ نشست‌ها: 359ms
-     _worker.obf.js   بارِ ماژول: 500ms CPU  •  مسیرِ نشست‌ها: 703ms
-
-   یعنی هر استارتِ isolate ~۰٫۵ ثانیه CPU می‌سوزاند و هر درخواست ۲ برابر
-   هزینه دارد. در لاگ‌های زندهٔ پنل، همین به‌صورتِ نشست‌های *کوتاه* (wall
-   ~۰٫۹s) که با «Worker exceeded CPU time limit» می‌میرند دیده می‌شد — یعنی
-   کاربر ترافیکش بی‌هیچ خطایی وسطِ کار قطع می‌شد.
-
-   پس: پیش‌فرض «cheap» است (رشته‌های پروتکل هنوز از اسکنر پنهان‌اند، ولی
-   بدونِ flattening و بدونِ decodeِ مکرر)؛ حالتِ سنگین با OBF_PRESET=heavy
-   در دسترس می‌ماند. عدد این تفاوت را جدی بگیرید: ۱۶ برابر. */
-const HEAVY = {
+/* ── ۴) گزینه‌های obfuscate ────────────────────────────────────────────────
+   ⚠️ اندازه‌گیریِ محلی (tests-manual/cpu-bench.cjs) روی همین مخزن:
+     worker.js        بارِ ماژول: 31ms CPU
+     _worker.obf.js   بارِ ماژول: 500ms CPU   (با stringArrayِ سراسری)
+   در لاگ‌های زنده همین به‌صورتِ نشست‌های کوتاه که با «Worker exceeded CPU
+   time limit» می‌میرند دیده می‌شد. پس پیش‌فرض دیگر stringArray ندارد. */
+const BASE = {
   compact: true,
-  controlFlowFlattening: true,
-  controlFlowFlatteningThreshold: 0.75,
   deadCodeInjection: false,
-  debugProtection: false,
+  debugProtection: false,          // در Workers یعنی حلقهٔ debugger → سوزاندنِ CPU
   disableConsoleOutput: false,
   identifierNamesGenerator: 'hexadecimal',
-  renameGlobals: false,               // شناسه‌های سطحِ ماژول (__MOD_DEFAULT__, ConnLimiter) دست‌نخورده می‌مانند
-  rotateStringArray: true,
-  selfDefending: false,
-  splitStrings: true,
-  /* ⚠️ transformObjectKeys خاموش شد (تستِ مسیرِ داده با _worker.obf.js):
-     با روشن بودنش، خواندنِ کلیدهای داینامیک (o.long/o.first در visionPadBlock)
-     در بستهٔ obfuscate‌شده زیر برخی شرایط گم می‌شد — یعنی مسیرِ XTLS-Vision
-     بی‌صدا خراب می‌شد (دادهٔ بعدیِ کاربر به سرورِ خروجی نمی‌رسید) در حالی که
-     همان کد از روی worker.js کامل درست کار می‌کرد. این گزینه فقط زیباییِ
-     obfuscation است و ارزشِ شکستنِ مسیرِ ترافیک را ندارد. */
-  transformObjectKeys: false,
-  splitStringsChunkLength: 4,
-  stringArray: true,
-  stringArrayCallsTransform: true,
-  stringArrayEncoding: ['rc4'],
-  stringArrayIndexShift: true,
-  stringArrayRotate: true,
-  stringArrayShuffle: true,
-  stringArrayWrappersCount: 2,
-  stringArrayWrappersChainedCalls: true,
-  stringArrayWrappersParametersMaxCount: 4,
-  stringArrayWrappersType: 'function',
-  stringArrayThreshold: 1,
-  unicodeEscapeSequence: true,
-};
-
-/* حالتِ سبک: همان پنهان‌سازیِ رشته‌ها (هدفِ اصلی: اسکنرِ استاتیکِ کلاودفلر
-   نباید «vless/trojan/clash» را ببیند) ولی بدونِ هزینهٔ زمانِ اجرا:
-   • controlFlowFlattening خاموش — هر تابع با یک switch، حلقه‌های داغ را
-     چند برابر کند می‌کند (فقط روی کدِ اجراشده اثر دارد، نه امنیت).
-   • رشته‌ها داخلِ آرایه می‌مانند (base64) ولی بدونِ crack/چند‌لایه wrapper.
-   • splitStrings/unicodeEscapeSequence خاموش — هم بیلد کوچک‌تر، هم parse
-     سریع‌تر (استارتِ isolate ارزان‌تر). */
-const CHEAP = {
-  compact: true,
-  controlFlowFlattening: false,
-  deadCodeInjection: false,
-  debugProtection: false,
-  disableConsoleOutput: false,
-  identifierNamesGenerator: 'hexadecimal',
-  renameGlobals: false,
-  rotateStringArray: true,
-  selfDefending: false,
-  splitStrings: false,
-  transformObjectKeys: false,
-  stringArray: true,
-  stringArrayCallsTransform: false,
-  stringArrayEncoding: ['base64'],
-  stringArrayIndexShift: true,
-  stringArrayRotate: true,
-  stringArrayShuffle: true,
-  stringArrayWrappersCount: 1,
-  stringArrayWrappersChainedCalls: false,
-  stringArrayWrappersParametersMaxCount: 2,
-  stringArrayWrappersType: 'variable',
-  stringArrayThreshold: 1,
+  renameGlobals: false,            // __MOD_DEFAULT__ و ConnLimiter باید بمانند
+  selfDefending: false,            // Function.prototype.toString → شکننده در Workers
   unicodeEscapeSequence: false,
-  /* ⚠️ رشته‌های بسیار بلند (بدنهٔ UI و صفحاتِ فریب) از مجموعهٔ رمزنگاری‌شده
-     بیرون می‌مانند: هر بار خواندنِ یک عضوِ آرایه یک decode می‌خواد و این
-     رشته‌های غول‌آسا در *استارت* خوانده می‌شوند — یعنی CPUِ isolate بی‌دلیل
-     می‌سوزد. این رشته‌ها دیگر رازِ پروتکلی نیستند (به مرورگر سرو می‌شوند)،
-     پس پنهان‌کردنشان هیچ ارزشی ندارد. */
-  reservedStrings: ['^[\\s\\S]{300,}$'],
+  transformObjectKeys: false,
 };
-
-const PRESETS = { cheap: CHEAP, heavy: HEAVY };
-const PRESET = String(process.env.OBF_PRESET || 'cheap').toLowerCase();
+const PRESETS = {
+  /* پیش‌فرض: فقط minify — کلماتِ حساس قبلاً با AST ماسک شده‌اند */
+  mask: { ...BASE, stringArray: false },
+  /* روشِ قدیمی (سازگاری): رشته‌ها داخلِ آرایهٔ base64 — گران‌تر در زمانِ اجرا */
+  cheap: {
+    ...BASE,
+    rotateStringArray: true,
+    splitStrings: false,
+    stringArray: true,
+    stringArrayCallsTransform: false,
+    stringArrayEncoding: ['base64'],
+    stringArrayIndexShift: true,
+    stringArrayRotate: true,
+    stringArrayShuffle: true,
+    stringArrayWrappersCount: 1,
+    stringArrayWrappersChainedCalls: false,
+    stringArrayWrappersParametersMaxCount: 2,
+    stringArrayWrappersType: 'variable',
+    stringArrayThreshold: 1,
+    reservedStrings: ['^[\\s\\S]{300,}$'],
+  },
+  /* سنگین — فقط برای آزمایش؛ ~۱۶ برابر CPUِ استارت */
+  heavy: {
+    ...BASE,
+    controlFlowFlattening: true,
+    controlFlowFlatteningThreshold: 0.75,
+    rotateStringArray: true,
+    splitStrings: true,
+    splitStringsChunkLength: 4,
+    stringArray: true,
+    stringArrayCallsTransform: true,
+    stringArrayEncoding: ['rc4'],
+    stringArrayIndexShift: true,
+    stringArrayRotate: true,
+    stringArrayShuffle: true,
+    stringArrayWrappersCount: 2,
+    stringArrayWrappersChainedCalls: true,
+    stringArrayWrappersParametersMaxCount: 4,
+    stringArrayWrappersType: 'function',
+    stringArrayThreshold: 1,
+  },
+};
+const PRESET = String(process.env.OBF_PRESET || 'mask').toLowerCase();
 if (!PRESETS[PRESET]) {
-  console.error('FATAL: OBF_PRESET باید cheap یا heavy باشد (دریافت: ' + PRESET + ')');
+  console.error('FATAL: OBF_PRESET باید mask یا cheap یا heavy باشد (دریافت: ' + PRESET + ')');
   process.exit(1);
 }
 const OBF_OPTIONS = PRESETS[PRESET];
@@ -230,26 +387,34 @@ const obfuscator = require('javascript-obfuscator');
 const result = obfuscator.obfuscate(src, OBF_OPTIONS);
 let out = result.getObfuscatedCode();
 
-/* ── ۳) انتشار دوبارهٔ exportهای سطحِ ماژول + بازگرداندنِ شناسه‌های runtime ──
-   WebSocketPair و connect از ماژول 'cloudflare:sockets'/globalهای ورکر می‌آیند؛
-   چون نامشان را در مرحلهٔ ۱ عوض کردیم، در انتهای فایل به‌صورت پارامترِ export
-   دوباره معرفی می‌شوند — ولی چون export statement نمی‌تواند global بپذیرد،
-   از const استفاده می‌کنیم: */
+/* ── ۵) انتشار دوبارهٔ exportهای سطحِ ماژول + بازگرداندنِ شناسه‌های runtime ── */
 const exportParts = [];
 if (needsDefaultPatch) exportParts.push('__MOD_DEFAULT__ as default');
 if (needsClassPatch) exportParts.push('ConnLimiter');
 out = 'const __CF_WS_PAIR__ = WebSocketPair;\n// (WebSocketPair اینجا فقط در همین خطِ اول به‌صورت آگاهانه باقی می‌ماند — global ورکر است، نه رشتهٔ پروتکل)\n' + out;
 out += '\nexport { ' + exportParts.join(', ') + ' };\n';
 
-/* ── ۴) اعتبارسنجی ── */
+/* ── ۶) اعتبارسنجی ──
+   ⚠️ این بخش قبلاً فقط «تعداد» را چاپ می‌کرد و کسی نگاهش نمی‌کرد؛ همان‌جا
+   بود که ۱۱ بار 'vless' در بستهٔ نهایی ماند و کلِ زحمتِ obfuscation بی‌اثر شد.
+   حالا اگر یک کلمهٔ حساس باقی بماند، بیلد شکست می‌خورد. */
 if (!/__MOD_DEFAULT__/.test(out) || !/ConnLimiter/.test(out)) {
   console.error('FATAL: شناسه‌های exportِ اصلی در خروجی یافت نشدند.');
   process.exit(1);
 }
-const leftover = (out.match(/\b(vless|trojan|clash)\b/g) || []).length;
-console.log(`    کلمات حساسِ باقی‌مانده در خروجی: ${leftover}`);
+const leftovers = [];
+for (const w of ['vless', 'trojan', 'clash', 'vmess', 'shadowsocks', 'outbounds']) {
+  const n = (out.match(new RegExp(w, 'gi')) || []).length;
+  if (n) leftovers.push(w + '×' + n);
+}
+if (leftovers.length) {
+  console.error('FATAL: کلماتِ حساس در بستهٔ نهایی باقی مانده‌اند: ' + leftovers.join(', '));
+  console.error('       (ماسکِ AST یک مورد را جا انداخته — بیلد متوقف شد تا فایلِ نشت‌کننده منتشر نشود)');
+  process.exit(1);
+}
 
 writeFileSync(OUT, out, 'utf8');
 const kb = (p) => (statSync(p).size / 1024).toFixed(0);
+console.log('    کلماتِ حساس در خروجی: ۰ ✓');
 console.log(`OK  worker.js (${kb(SRC)} KB)  →  _worker.obf.js (${kb(OUT)} KB)`);
 console.log('    حالا محتوای _worker.obf.js را در داشبورد کلاودفلر (Quick Edit → Paste) قرار دهید.');

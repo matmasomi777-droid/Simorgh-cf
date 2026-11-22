@@ -177,7 +177,15 @@ async function startExitServer() {
         realitySettings: { dest: SNI + ':443', xver: 0, serverNames: [SNI], privateKey: b64u(pk8.slice(pk8.length - 32)), shortIds: ['', 'dead3611ae00'] },
       },
     }],
-    outbounds: [{ protocol: 'freedom', tag: 'direct' }],
+    /* ⚠️ Xray ≥ v26 یک «قاعدهٔ نهایی» پیش‌فرض دارد که هر مقصدِ IP خصوصی/لوپ‌بک را
+       می‌بندد (محافظتِ SSRF): «target blocked by a finalrule … blackholing».
+       مقصدِ این تست روی 127.0.0.1 است، پس بدونِ این استثنا همهٔ درخواست‌ها
+       بی‌صدا می‌میرند و تست در برابرِ v26 قرمز می‌شود — در حالی که مسیرِ داده
+       سالم است. (کاربرِ واقعی به IP خصوصی وصل نمی‌شود، پس این فقط برای تست است.) */
+    outbounds: [{
+      protocol: 'freedom', tag: 'direct',
+      settings: { finalRules: [{ action: 'allow', ip: ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '::1/128'] }] },
+    }],
   };
   const p = path.join(TMP, 'exit-server.json');
   fs.writeFileSync(p, JSON.stringify(config, null, 2));
